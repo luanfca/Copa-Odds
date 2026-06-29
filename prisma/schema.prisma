@@ -1,0 +1,93 @@
+// Prisma schema — Copa Odds
+// Banco: SQLite local (mudar para postgresql:// para produção)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Jogo da Copa do Mundo
+model Match {
+  id        String   @id @default(cuid())
+  dateTime  DateTime
+  homeTeam  String
+  awayTeam  String
+  stage     String   // "Fase de Grupos", "Oitavas", "Quartas", "Semi", "Final"
+  homeFlag  String?  // código ISO do país (ex: "BR", "FR")
+  awayFlag  String?
+  players   Player[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("matches")
+}
+
+// Jogador presente no mercado de desarmes de um jogo
+model Player {
+  id        String        @id @default(cuid())
+  name      String        // nome normalizado (slug ASCII)
+  displayName String      // nome original para exibição
+  team      String
+  match     Match         @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  matchId   String
+  snapshots OddSnapshot[]
+  createdAt DateTime      @default(now())
+
+  @@unique([matchId, name])
+  @@map("players")
+}
+
+// Snapshot de odd coletado a cada execução do scraping
+model OddSnapshot {
+  id          String   @id @default(cuid())
+  player      Player   @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  playerId    String
+  house       String   // "betfair" | "betmgm" | "superbet"
+  market      String   @default("desarmes")
+  line        String   // "1+", "2+", "3+" (número de desarmes)
+  value       Float    // odd decimal (ex: 1.85)
+  url         String?  // URL do jogo na casa de apostas
+  collectedAt DateTime @default(now())
+
+  @@index([playerId, house, line])
+  @@index([collectedAt])
+  @@map("odd_snapshots")
+}
+
+// Alertas de odd definidos pelo usuário
+model Alert {
+  id          String   @id @default(cuid())
+  playerName  String?  // null = qualquer jogador
+  minOdd      Float    // limiar mínimo de odd
+  house       String?  // null = qualquer casa
+  line        String?  // null = qualquer linha
+  active      Boolean  @default(true)
+  triggeredAt DateTime? // última vez que foi disparado
+  createdAt   DateTime  @default(now())
+
+  @@map("alerts")
+}
+
+// Registro de execuções do scraping (para exibir "Atualizado em")
+model ScrapeLog {
+  id          String   @id @default(cuid())
+  startedAt   DateTime @default(now())
+  finishedAt  DateTime?
+  status      String   // "running" | "success" | "partial" | "failed"
+  betfairOk   Boolean  @default(false)
+  betmgmOk    Boolean  @default(false)
+  superbetOk  Boolean  @default(false)
+  bet365Ok    Boolean  @default(false)
+  betssonOk   Boolean  @default(false)
+  pitacoOk    Boolean  @default(false)
+  errorMsg    String?
+  matchCount  Int      @default(0)
+  playerCount Int      @default(0)
+  oddCount    Int      @default(0)
+
+  @@map("scrape_logs")
+}

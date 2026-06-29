@@ -1,0 +1,39 @@
+# Dependências
+node_modules/
+.npm
+
+# Next.js
+.next/
+out/
+
+# Build
+build/
+dist/
+
+# Banco de dados local
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Playwright
+.playwright-sessions/
+playwright-report/
+test-results/
+
+# Variáveis de ambiente
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Arquivos de debug/cache
+tsconfig.tsbuildinfo
+*.tsbuildinfo
