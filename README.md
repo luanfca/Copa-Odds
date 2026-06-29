@@ -61,8 +61,8 @@ Pre-requisitos: Node.js 18+ instalado.
 
 ```bash
 # 1. Clonar o repositorio
-git clone https://github.com/SEU-USUARIO/comparador-odds.git
-cd comparador-odds
+git clone https://github.com/luanfca/Copa-Odds.git
+cd Copa-Odds
 
 # 2. Instalar as dependencias
 npm install
