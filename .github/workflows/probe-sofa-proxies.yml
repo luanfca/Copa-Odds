@@ -1,0 +1,13 @@
+name: Diagnóstico temporário SofaScore
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Testar saídas públicas
+        run: node scripts/probe-sofa-proxies.mjs
