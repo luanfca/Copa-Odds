@@ -31,11 +31,11 @@ function relativeTime(isoDate: string | null): string {
 }
 
 const rankingWarmTargets = [
-  { market: 'desarmes', cacheKey: 'desarmes_false_all_league' },
-  { market: 'faltas_cometidas', cacheKey: 'faltas_faltas_cometidas_all_league' },
-  { market: 'faltas_sofridas', cacheKey: 'faltas_faltas_sofridas_all_league' },
-  { market: 'finalizacao', cacheKey: 'finalizacao_finalizacao_all_league' },
-  { market: 'chutes_ao_gol', cacheKey: 'finalizacao_chutes_ao_gol_all_league' },
+  { market: 'desarmes', pageKey: 'desarmes', group: 'desarmes' },
+  { market: 'faltas_cometidas', pageKey: 'faltas', group: 'faltas' },
+  { market: 'faltas_sofridas', pageKey: 'faltas', group: 'faltas' },
+  { market: 'finalizacao', pageKey: 'finalizacao', group: 'finalizacao' },
+  { market: 'chutes_ao_gol', pageKey: 'finalizacao', group: 'finalizacao' },
 ] as const;
 
 let rankingWarmPromise: Promise<void> | null = null;
@@ -46,11 +46,34 @@ function warmRankingTabs(): Promise<void> {
   const year = new Date().getFullYear();
   rankingWarmPromise = (async () => {
     for (const target of rankingWarmTargets) {
+      let prefs: {
+        maxGames?: number;
+        selectedCompetition?: string;
+        historyScope?: 'league' | 'all';
+      } = {};
+      try {
+        prefs = JSON.parse(
+          localStorage.getItem(`rankingPrefs_${target.pageKey}`) || '{}',
+        );
+      } catch {
+        /* preferências inválidas: usa padrões abaixo */
+      }
+      const maxGames =
+        typeof prefs.maxGames === 'number' && prefs.maxGames >= 1
+          ? Math.min(prefs.maxGames, 10)
+          : 10;
+      const competition = prefs.selectedCompetition || 'all';
+      const historyScope =
+        prefs.historyScope === 'all' ? 'all' : 'league';
+      const cacheKey =
+        target.group === 'desarmes'
+          ? `desarmes_false_${competition}_${historyScope}`
+          : `${target.group}_${target.market}_${competition}_${historyScope}`;
       if (
-        getCachedMarket(target.cacheKey, false, {
-          maxGames: 10,
+        getCachedMarket(cacheKey, false, {
+          maxGames,
           year,
-          historyScope: 'league',
+          historyScope,
         })
       ) {
         continue;
@@ -58,17 +81,18 @@ function warmRankingTabs(): Promise<void> {
       try {
         const params = new URLSearchParams({
           market: target.market,
-          maxGames: '10',
+          maxGames: String(maxGames),
           year: String(year),
-          historyScope: 'league',
+          historyScope,
         });
+        if (competition !== 'all') params.set('competition', competition);
         const response = await fetch(`/api/desarmes?${params}`, { cache: 'no-store' });
         if (!response.ok) continue;
         const data = await response.json();
-        setCachedMarket(target.cacheKey, data, false, {
-          maxGames: 10,
+        setCachedMarket(cacheKey, data, false, {
+          maxGames,
           year,
-          historyScope: 'league',
+          historyScope,
         });
       } catch {
         // Prefetch é uma otimização; a página mantém seu fallback normal.
