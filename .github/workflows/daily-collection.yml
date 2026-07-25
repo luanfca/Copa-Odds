@@ -31,6 +31,9 @@ jobs:
       - name: Instalar aplicação
         run: npm ci
 
+      - name: Instalar Chromium
+        run: npx playwright install --with-deps chromium
+
       - name: Iniciar gateway SofaScore
         run: |
           node scripts/sofascore-playwright-server.mjs > /tmp/sofascore.log 2>&1 &
