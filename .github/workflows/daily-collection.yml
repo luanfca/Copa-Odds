@@ -36,7 +36,7 @@ jobs:
         run: |
           node scripts/sofascore-playwright-server.mjs > /tmp/sofascore.log 2>&1 &
           for attempt in {1..30}; do
-            if curl --fail --silent http://127.0.0.1:54545/live > /dev/null; then
+            if curl --fail --silent --max-time 25 http://127.0.0.1:54545/live > /dev/null; then
               exit 0
             fi
             sleep 1

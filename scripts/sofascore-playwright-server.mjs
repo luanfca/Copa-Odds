@@ -14,8 +14,13 @@ import { chromium } from 'playwright';
 const HOST = process.env.SOFA_HOST || '127.0.0.1';
 const PORT = Number(process.env.SOFA_PORT || 54545);
 const API = 'https://www.sofascore.com/api/v1';
-const PROXY_PREFIX =
-  process.env.SOFA_PROXY_PREFIX || 'https://proxy.cors.sh/';
+const PROXY_PREFIXES = (
+  process.env.SOFA_PROXY_PREFIX ||
+  'https://test.cors.workers.dev/?,https://proxy.cors.sh/'
+)
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
@@ -81,22 +86,28 @@ async function ensurePage() {
 
 async function proxyGet(path) {
   let lastError;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const response = await fetch(PROXY_PREFIX + API + path, {
-        headers: {
-          Accept: 'application/json, text/plain, */*',
-          'User-Agent': UA,
-        },
-      });
-      if (response.ok) return await response.json();
-      lastError = new Error(`Proxy HTTP ${response.status} em ${path}`);
-    } catch (error) {
-      lastError = error;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    for (const prefix of PROXY_PREFIXES) {
+      try {
+        const response = await fetch(prefix + API + path, {
+          headers: {
+            Accept: 'application/json, text/plain, */*',
+            Origin: 'https://copa-odds.onrender.com',
+            'User-Agent': UA,
+          },
+          signal: AbortSignal.timeout(20_000),
+        });
+        if (response.ok) return await response.json();
+        lastError = new Error(
+          `Proxy ${new URL(prefix).host} HTTP ${response.status} em ${path}`,
+        );
+      } catch (error) {
+        lastError = error;
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 700 * (attempt + 1)));
   }
-  throw lastError || new Error(`Falha no proxy SofaScore em ${path}`);
+  throw lastError || new Error(`Falha nos proxies SofaScore em ${path}`);
 }
 
 async function sofaGetFresh(path) {
