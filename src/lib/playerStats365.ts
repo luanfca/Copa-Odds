@@ -401,9 +401,11 @@ export async function getPlayerHistory(
     total,
     average: kept.length ? total / kept.length : 0,
   };
+  if (!kept.length) return null;
+
   const key = historyDbKey365(playerName, team, market, allComps, opts);
   await setSharedHistory(key, history).catch(() => null);
-  return kept.length ? history : null;
+  return history;
 }
 
 // ─── Histórico de TIME (soma de todos os jogadores por jogo) ──────────────

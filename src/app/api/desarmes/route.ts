@@ -74,6 +74,34 @@ function withHistoryMeta(
   };
 }
 
+/** Snapshot diário já foi completamente processado; ausências são definitivas
+ * para este lote e não devem iniciar polling no navegador. */
+function withCompletedSnapshotMeta(body: any) {
+  const players = Array.isArray(body?.players) ? body.players : [];
+  const filled = players.filter(
+    (player: any) => player?.history?.entries?.length > 0,
+  ).length;
+  const total = players.length;
+  const missing = total - filled;
+  return {
+    ...body,
+    historyMeta: {
+      filled,
+      missing,
+      resolved: total,
+      total,
+      coverageOk: true,
+      job: {
+        running: false,
+        done: true,
+        total,
+        filled,
+        missing,
+      },
+    },
+  };
+}
+
 async function prepareBodyWithHistory(
   body: any,
   market: string,
@@ -197,7 +225,7 @@ export async function GET(request: NextRequest) {
       for (const player of body?.players ?? []) {
         applyHistoryAnalysis(player, maxGames);
       }
-      return NextResponse.json(body, {
+      return NextResponse.json(withCompletedSnapshotMeta(body), {
         headers: {
           'Cache-Control': 'public, s-maxage=15, stale-while-revalidate=30',
           'X-Cache': 'SNAPSHOT',
