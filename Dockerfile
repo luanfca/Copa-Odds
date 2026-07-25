@@ -39,8 +39,8 @@ COPY --from=builder --chown=node:node /app/.next ./.next
 COPY --from=builder --chown=node:node /app/public ./public
 COPY --from=builder --chown=node:node /app/next.config.js ./next.config.js
 
-RUN mkdir -p /app/data /app/.playwright-sessions \
-    && chown -R node:node /app/data /app/.playwright-sessions
+RUN mkdir -p /app/data /app/.playwright-sessions /app/logs \
+    && chown -R node:node /app/data /app/.playwright-sessions /app/logs
 
 USER node
 
