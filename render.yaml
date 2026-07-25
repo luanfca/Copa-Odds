@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: copa-odds
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/admin/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: USE_MOCK
+        value: "false"
