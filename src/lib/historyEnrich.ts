@@ -6,10 +6,10 @@
  */
 
 import {
+  getPlayerHistory,
   historyDbKey,
   type PlayerHistory,
 } from './sofascoreStats';
-import { getPlayerHistory } from './playerStats365';
 import { getSharedHistory, setSharedHistory } from './sharedCache';
 import { computeLineAnalysis } from './poisson';
 
@@ -18,7 +18,7 @@ export const HISTORY_FULL_GAMES = 10;
 
 const LINES = ['1+', '2+', '3+', '4+'];
 
-/** Mesma chave do SQLite (hist-v12) — histórico permanente. */
+/** Mesma chave do banco (hist-v13) — histórico permanente. */
 export function fullHistoryKey(
   team: string,
   name: string,

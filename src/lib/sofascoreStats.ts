@@ -416,7 +416,7 @@ export async function getTeamFinishedEvents(
   competitionName?: string,
   tournamentId?: number,
 ): Promise<SofaTeamEvent[]> {
-  const cacheKey = `tev_${normalizeName(teamName)}_${tournamentId ?? (competitionName ? normalizeName(competitionName) : 'all')}`;
+  const cacheKey = `tev-v2_${normalizeName(teamName)}_${tournamentId ?? (competitionName ? normalizeName(competitionName) : 'all')}`;
   
   // Cache SQLite: evita refetching eventos do mesmo time+torneio
   const cached = await getCacheTeamEvents(cacheKey);
@@ -631,8 +631,8 @@ export function historyDbKey(
       ? 'all'
       : `league:${opts?.competition || 'brasileirao'}`;
   return [
-    // v12: shotsOnTarget via onTargetScoringAttempt (campo correto do lineups SofaScore)
-    'hist-v12',
+    // v13: histórico oficial via Chromium + API SofaScore.
+    'hist-v13',
     normalizeName(team),
     normalizeName(playerName),
     market,

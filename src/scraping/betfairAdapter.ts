@@ -44,6 +44,29 @@ function resolveBetfairMarketKey(marketNameLower: string, cardTitleLower: string
 // ─── Configuração ─────────────────────────────────────────────────────────────
 
 const BETFAIR_BASE = 'https://www.betfair.bet.br';
+const BETFAIR_BFF =
+  'https://apitbd.betfair.bet.br/api/tbd/bff-gql/v11/?_ak=K61C39rIC0WKzoQ7';
+const BETFAIR_PERSISTED_QUERY =
+  'GenericSwitcherCardSiblings#7329aef5e2e82b4e64d85ac56a1c1983';
+const BETFAIR_CARD_DOCUMENT = 'Card#89c9f89d8e907779c485da6378d82672';
+
+/**
+ * Uma semente atual é suficiente para o switcher retornar todos os irmãos
+ * da competição. Depois do primeiro sucesso, os IDs salvos nas odds do banco
+ * viram as sementes das coletas seguintes.
+ */
+const BETFAIR_SEED_EVENTS: Record<string, string[]> = {
+  brasileirao: ['35834697', '35834703'],
+  mls: ['35842493'],
+};
+
+// Templates públicos da aba Jogador. Os sufixos /e/{eventId} mudam por jogo.
+const BETFAIR_PLAYER_CARD_TEMPLATES = [
+  'Z9lMvxQAACQAvOTN',
+  'Z91V-BEAACEAFo5n',
+  'Z9lJKxQAACYAvN-Y',
+  'Z9lBCRQAACYAvNN9',
+];
 
 /** URLs de competições na Betfair */
 const COMPETITION_URLS: Record<string, { url: string; name: string }> = {
@@ -318,6 +341,168 @@ async function suppressCookieBanner(page: Page): Promise<void> {
   }
 }
 
+function collectBetfairEventUrls(value: unknown, output = new Set<string>()): Set<string> {
+  if (typeof value === 'string') {
+    if (/\/e-\d+/.test(value)) {
+      const clean = value.replace(/^\/+/, '').split('?')[0];
+      output.add(clean.startsWith('http') ? clean : `${BETFAIR_BASE}/apostas/${clean}`);
+    }
+    return output;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectBetfairEventUrls(item, output);
+    return output;
+  }
+  if (value && typeof value === 'object') {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      collectBetfairEventUrls(item, output);
+    }
+  }
+  return output;
+}
+
+async function getBetfairSeedIds(competitionKey: string): Promise<string[]> {
+  const seeds = new Set(BETFAIR_SEED_EVENTS[competitionKey] ?? []);
+  const configured = process.env[`BETFAIR_SEED_${competitionKey.toUpperCase()}`];
+  for (const id of configured?.match(/\d{7,}/g) ?? []) seeds.add(id);
+
+  // Reaproveita automaticamente eventos da última coleta bem-sucedida.
+  try {
+    const { prisma } = await import('../lib/prisma');
+    const previous = await prisma.oddSnapshot.findMany({
+      where: { house: 'betfair', url: { not: null } },
+      orderBy: { collectedAt: 'desc' },
+      take: 80,
+      select: { url: true },
+    });
+    const competitionPart =
+      competitionKey === 'brasileirao' ? 'brasileir' :
+      competitionKey === 'mls' ? '/mls/' :
+      '';
+    for (const row of previous) {
+      const url = row.url ?? '';
+      if (competitionPart && !url.toLowerCase().includes(competitionPart)) continue;
+      const id = url.match(/\/e-(\d+)/)?.[1];
+      if (id) seeds.add(id);
+    }
+  } catch (error) {
+    logger.debug('[Betfair] Sem sementes anteriores no banco', { error: String(error) });
+  }
+
+  return [...seeds];
+}
+
+/**
+ * Descobre jogos pelo switcher GraphQL público. Esse caminho funciona mesmo
+ * quando www.betfair.bet.br redireciona IPs de datacenter para o suporte.
+ */
+async function discoverBetfairMatchesViaBff(
+  context: BrowserContext,
+  competitionKey: string,
+): Promise<string[]> {
+  const seeds = await getBetfairSeedIds(competitionKey);
+  for (const eventId of seeds) {
+    try {
+      const response = await context.request.post(
+        `${BETFAIR_BFF}&currentViewUrn=${encodeURIComponent(`ppb:tbd:view:event:${eventId}`)}`,
+        {
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            Origin: BETFAIR_BASE,
+            Referer: `${BETFAIR_BASE}/`,
+          },
+          data: {
+            operations: [{
+              operationName: 'GenericSwitcherCardSiblings',
+              variables: { urn: `ppb:tbd:card:genericswitcher:event:${eventId}` },
+              extensions: {
+                clientLibrary: { name: '@apollo/client', version: '4.1.6' },
+                persistedQuery: { version: 1, sha256Hash: BETFAIR_PERSISTED_QUERY },
+              },
+            }],
+          },
+          timeout: PAGE_TIMEOUT_MS,
+        },
+      );
+      if (!response.ok()) continue;
+      const data = await response.json();
+      const urls = [...collectBetfairEventUrls(data)]
+        .filter((url) =>
+          competitionKey === 'brasileirao'
+            ? /brasileir/i.test(url)
+            : competitionKey === 'mls'
+              ? /\/mls\//i.test(url)
+              : true,
+        );
+      if (urls.length > 0) {
+        logger.info(
+          `[Betfair] BFF direto encontrou ${urls.length} jogos com a semente ${eventId}.`,
+        );
+        return urls;
+      }
+    } catch (error) {
+      logger.debug(`[Betfair] Semente ${eventId} falhou`, { error: String(error) });
+    }
+  }
+  return [];
+}
+
+/**
+ * Coleta os cards de jogador diretamente do BFF. As cotações vêm em liveData
+ * no mesmo payload e são processadas pelo extrator já usado no fluxo visual.
+ */
+async function fetchBetfairPlayerCardsDirect(
+  context: BrowserContext,
+  matchUrl: string,
+  capturedData: Array<{ url: string; data: unknown; pageUrl?: string }>,
+): Promise<boolean> {
+  const eventId = matchUrl.match(/\/e-(\d+)/)?.[1];
+  if (!eventId) return false;
+
+  const currentViewUrn = `ppb:tbd:view:event:${eventId}?=tab=jogador`;
+  const bffUrl = `${BETFAIR_BFF}&currentViewUrn=${encodeURIComponent(currentViewUrn)}`;
+  try {
+    const response = await context.request.post(bffUrl, {
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        Origin: BETFAIR_BASE,
+        Referer: matchUrl,
+      },
+      data: {
+        variables: {
+          urn: BETFAIR_PLAYER_CARD_TEMPLATES.map(
+            (template) =>
+              `ppb:tbd:cardgroup:pebble:marketTemplateEvent:${template}/e/${eventId}`,
+          ),
+          numberOfFilledCardsInCardGroup: 2,
+          preferences: {
+            userProducts: ['SPORTSBOOK', 'GAMES'],
+            favoriteSports: [],
+          },
+          productExclusions: [],
+          experiments: [{
+            id: 'uki_safety_rti_10k_stakes',
+            variant: 'display',
+          }],
+        },
+        documentId: BETFAIR_CARD_DOCUMENT,
+      },
+      timeout: PAGE_TIMEOUT_MS,
+    });
+    if (!response.ok()) return false;
+    const data = await response.json();
+    const text = JSON.stringify(data);
+    if (!/Chutes no gol|comete uma falta|SHOT|FOUL/i.test(text)) return false;
+    capturedData.push({ url: bffUrl, data, pageUrl: matchUrl });
+    return true;
+  } catch (error) {
+    logger.debug(`[Betfair] BFF direto falhou em ${eventId}`, { error: String(error) });
+    return false;
+  }
+}
+
 /** Navega para uma competição, entra em cada jogo e extrai odds. */
 async function scrapeCompetitionMatches(
   page: Page,
@@ -334,11 +519,15 @@ async function scrapeCompetitionMatches(
 
 
     // Coleta links de eventos individuais na página da Copa
-    const matchLinks: string[] = await page.evaluate(() =>
+    let matchLinks: string[] = await page.evaluate(() =>
       Array.from(document.querySelectorAll('a'))
         .map(a => a.href)
         .filter(href => href?.includes('/e-') || href?.includes('/event-'))
     );
+
+    if (matchLinks.length === 0) {
+      matchLinks = await discoverBetfairMatchesViaBff(context, competitionKey);
+    }
 
     let uniqueMatchLinks = Array.from(new Set(matchLinks))
       .filter(url => /\/e-\d+/.test(url))
@@ -387,6 +576,14 @@ async function scrapeCompetitionMatches(
       }
 
       const p = (async () => {
+        // O BFF é muito mais rápido e não depende da renderização/geo do site.
+        const directOk = await fetchBetfairPlayerCardsDirect(
+          context,
+          matchUrl,
+          capturedData,
+        );
+        if (directOk) return;
+
         const matchPage = await createScrapingPage(context, capturedData);
         try {
           await scrapeMatchPage(matchPage, matchUrl, capturedData, competitionKey);
@@ -2669,10 +2866,9 @@ function extractFromBffCard(card: any, pageUrl?: string, marketPricesMap?: Map<s
 
       // Pula mercados não suportados / desconhecidos
       if (!marketKey || marketKey === 'envolvimentos_faltas') continue;
-      // Faltas cometidas: fonte da verdade é o DOM multi-col
-      // ("Jogador comete uma falta" → 1+|2+|3+). O BFF manda linhas/odds
-      // desalinhadas (ex. Wallisson 1.08/1.4/2.1 em vez de 1.06/1.36/2.3).
-      if (marketKey === 'faltas_cometidas') continue;
+      // O BFF v11 entrega os três mercados separados e alinhados pelo
+      // marketType (COMMIT_1/2/3_OR_MORE_FOULS). Isso é mais confiável que
+      // inferir colunas pelo texto visual e também funciona no servidor cloud.
       // Ignora marcador/cartões etc.
       if (/GOALSCORER|BOOKED|CARD|ASSIST/i.test(String(market.marketType ?? ''))) continue;
       

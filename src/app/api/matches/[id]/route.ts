@@ -4,7 +4,7 @@ import { prisma } from '@/lib/prisma';
 import { mockOddsData } from '@/lib/mockData';
 import { findBestOdds, type OddEntry } from '@/lib/arbitrage';
 import { isLikelyPlayerName, isSamePlayer } from '@/lib/normalize';
-import { getPlayerHistory } from '@/lib/playerStats365';
+import { getPlayerHistory } from '@/lib/sofascoreStats';
 import { getTeamFinishedEvents } from '@/lib/sofascoreStats';
 import { getTeamStatAvg } from '@/lib/fotmobStats';
 import { getSharedHistory, setSharedHistory } from '@/lib/sharedCache';

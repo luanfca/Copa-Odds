@@ -1,6 +1,9 @@
 /**
- * Adaptador Pitaco v2 - otimizado para processamento rápido.
- * Processa apenas os primeiros 5 jogos por competição.
+ * Adaptador Pitaco v3.
+ *
+ * A lista de jogos vem de uma resposta protobuf. Em ambientes cloud o HTML
+ * pode não renderizar os links, portanto a resposta binária é a fonte
+ * principal e o DOM fica como fallback.
  */
 import { BrowserContext } from 'playwright'
 import { logger } from '../lib/logger'
@@ -41,8 +44,43 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms))
 // Set para logar mercados desconhecidos apenas uma vez por sessão
 const loggedUnknownMarkets = new Set<string>();
 
-// Limita número de jogos por competição para não travar
-const MAX_GAMES_PER_COMP = 5;
+// Uma rodada cheia + os próximos jogos. Pode ser ajustado no ambiente.
+const MAX_GAMES_PER_COMP = Math.max(
+  1,
+  parseInt(process.env.PITACO_MAX_GAMES ?? '24', 10),
+);
+
+const textDecoder = new TextDecoder('utf-8', { fatal: false })
+
+/**
+ * Extrai IDs de evento da resposta de GetUiCompetitionTabContent.
+ * Os IDs aparecem como strings protobuf de 11 dígitos. IDs de times e
+ * campeonatos são varints nessa resposta; as strings numéricas encontradas
+ * aqui são justamente os eventos apresentados na aba "Partidas".
+ */
+function extractCompetitionEventIds(buf: Uint8Array): string[] {
+  const ids = new Set<string>()
+
+  const walk = (node: Node | undefined, depth: number) => {
+    if (!node || depth > 14) return
+    for (const fields of node.values()) {
+      for (const field of fields) {
+        if (field.k !== 'L') continue
+        const raw = field.v as Uint8Array
+        const value = textDecoder.decode(raw)
+        if (/^\d{11}$/.test(value)) ids.add(value)
+
+        // decode() é tolerante a payloads que não são submensagens.
+        // Só continua quando encontrou ao menos um campo válido.
+        const child = decode(raw)
+        if (child.size > 0) walk(child, depth + 1)
+      }
+    }
+  }
+
+  walk(decode(ungrpc(buf)), 0)
+  return [...ids]
+}
 
 // Parse protobuf
 function parseMarkets(root: Node): Map<string, Array<{ player: string; team: string; line: string; outcomeId: string }>> {
@@ -125,12 +163,17 @@ export async function scrapePitaco(context: BrowserContext, competitionKeys?: st
 
       const compPage = await context.newPage()
       const compUrl = `${PITACO_BASE}/betting/competitions/${compId}?tab=matches`
-      // Coleta event IDs de hrefs E de respostas de rede (gRPC/JSON)
+      // Coleta event IDs de hrefs E da resposta protobuf oficial.
       const networkIds = new Set<string>()
       compPage.on('response', async (resp) => {
         try {
           const u = resp.url()
           if (!/competition|event|match|betting/i.test(u)) return
+          if (u.includes('GetUiCompetitionTabContent')) {
+            const body = new Uint8Array(await resp.body())
+            for (const id of extractCompetitionEventIds(body)) networkIds.add(id)
+            return
+          }
           const txt = await resp.text().catch(() => '')
           for (const m of txt.matchAll(/\/betting\/events\/(\d{8,})/g)) {
             networkIds.add(m[1])
@@ -187,13 +230,13 @@ export async function scrapePitaco(context: BrowserContext, competitionKeys?: st
       const eventIds = rawIds
         .filter(id => id !== compId)
         .filter((id, i, arr) => arr.indexOf(id) === i)
-        .slice(0, MAX_GAMES_PER_COMP) // Limita a 5 jogos
+        .slice(0, MAX_GAMES_PER_COMP)
 
       if (eventIds.length === 0) {
         logger.warn(`[Pitaco] ${compKey}: Nenhum jogo encontrado (hrefs: ${hrefs.length}, networkIds: ${networkIds.size})`)
         continue
       }
-      logger.info(`[Pitaco] ${compKey}: ${eventIds.length} jogos para coletar (limitado)`);
+      logger.info(`[Pitaco] ${compKey}: ${eventIds.length} jogos para coletar.`);
 
       // Processa jogos em paralelo com limite de concorrência
       const CONCURRENCY = 3;

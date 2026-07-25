@@ -34,6 +34,18 @@ jobs:
       - name: Instalar Chromium
         run: npx playwright install --with-deps chromium
 
+      - name: Iniciar SofaScore via Chromium
+        run: |
+          node scripts/sofascore-playwright-server.mjs > /tmp/sofascore.log 2>&1 &
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:54545/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/sofascore.log
+          exit 1
+
       - name: Sincronizar banco
         run: |
           for attempt in {1..5}; do
@@ -48,3 +60,7 @@ jobs:
 
       - name: Executar lote diário completo
         run: npm run scrape
+
+      - name: Mostrar log SofaScore em caso de falha
+        if: failure()
+        run: tail -n 300 /tmp/sofascore.log || true

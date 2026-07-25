@@ -1,6 +1,7 @@
 import { prisma } from './prisma';
-import { getFinishedGames, getPlayerHistory } from './playerStats365';
+import { getPlayerHistory } from './sofascoreStats';
 import { getStartersForMatch } from './lineups365';
+import { prewarmSofaScoreCache } from './prewarm';
 import { rebuildApiSnapshots } from './apiSnapshot';
 
 const HISTORY_MARKETS = [
@@ -69,13 +70,12 @@ export async function buildDailyDataset(
     `[DailyDataset] Iniciando: ${players.length} jogadores, ${matches.size} jogos`,
   );
 
-  // Valida a fonte de histórico antes de substituir qualquer snapshot.
-  // getGameMemberStats mantém promise-cache por jogo, então todos os jogadores
-  // e mercados abaixo reutilizam os mesmos payloads do 365Scores.
-  const finishedGames = await getFinishedGames();
-  if (players.length > 0 && finishedGames.length === 0) {
+  // Valida a fonte oficial antes de substituir qualquer snapshot. O prewarm
+  // resolve os times no SofaScore e mantém os eventos compartilhados no banco.
+  const prewarm = await prewarmSofaScoreCache(true);
+  if (players.length > 0 && prewarm.events === 0) {
     throw new Error(
-      '365Scores não retornou jogos finalizados; lote anterior mantido para evitar publicar históricos vazios.',
+      'SofaScore não retornou jogos finalizados; lote anterior mantido para evitar publicar históricos vazios.',
     );
   }
 

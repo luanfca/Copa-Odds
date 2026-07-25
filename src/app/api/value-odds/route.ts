@@ -4,7 +4,7 @@ import { mockOddsData, mockMatches } from '@/lib/mockData';
 import { isSamePlayer } from '@/lib/normalize';
 import { computeProbableStarterIds } from '@/lib/starters';
 import { getStartersForMatch, type MatchStarters } from '@/lib/lineups365';
-import { getPlayerHistory } from '@/lib/playerStats365';
+import { getPlayerHistory } from '@/lib/sofascoreStats';
 
 import { voCache, voRevalidating, setVoCache, setVoRevalidating, VO_TTL, VO_STALE_TTL } from '@/lib/cacheInvalidation';
 import { broadcastScrapeError } from '@/lib/ws-server';

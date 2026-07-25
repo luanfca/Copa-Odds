@@ -6,7 +6,7 @@ import { Trophy, Star, RefreshCw, CheckCircle2, AlertTriangle, XCircle, Clock, Z
 import { cn } from '@/lib/utils';
 import { useState, useEffect } from 'react';
 import { useToast } from '@/components/ui/use-toast';
-import { invalidateMarket } from '@/lib/marketCache';
+import { getCachedMarket, invalidateMarket, setCachedMarket } from '@/lib/marketCache';
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 
@@ -28,6 +28,56 @@ function relativeTime(isoDate: string | null): string {
   const hrs = Math.floor(min / 60);
   if (hrs < 24) return `${hrs}h atrás`;
   return `${Math.floor(hrs / 24)}d atrás`;
+}
+
+const rankingWarmTargets = [
+  { market: 'desarmes', cacheKey: 'desarmes_false_all_league' },
+  { market: 'faltas_cometidas', cacheKey: 'faltas_faltas_cometidas_all_league' },
+  { market: 'faltas_sofridas', cacheKey: 'faltas_faltas_sofridas_all_league' },
+  { market: 'finalizacao', cacheKey: 'finalizacao_finalizacao_all_league' },
+  { market: 'chutes_ao_gol', cacheKey: 'finalizacao_chutes_ao_gol_all_league' },
+] as const;
+
+let rankingWarmPromise: Promise<void> | null = null;
+
+/** Preenche em segundo plano o mesmo cache usado pelas páginas de ranking. */
+function warmRankingTabs(): Promise<void> {
+  if (rankingWarmPromise) return rankingWarmPromise;
+  const year = new Date().getFullYear();
+  rankingWarmPromise = (async () => {
+    for (const target of rankingWarmTargets) {
+      if (
+        getCachedMarket(target.cacheKey, false, {
+          maxGames: 10,
+          year,
+          historyScope: 'league',
+        })
+      ) {
+        continue;
+      }
+      try {
+        const params = new URLSearchParams({
+          market: target.market,
+          maxGames: '10',
+          year: String(year),
+          historyScope: 'league',
+        });
+        const response = await fetch(`/api/desarmes?${params}`, { cache: 'no-store' });
+        if (!response.ok) continue;
+        const data = await response.json();
+        setCachedMarket(target.cacheKey, data, false, {
+          maxGames: 10,
+          year,
+          historyScope: 'league',
+        });
+      } catch {
+        // Prefetch é uma otimização; a página mantém seu fallback normal.
+      }
+    }
+  })().finally(() => {
+    rankingWarmPromise = null;
+  });
+  return rankingWarmPromise;
 }
 
 // ─── StatusPill ──────────────────────────────────────────────────────────────
@@ -123,6 +173,22 @@ export function Navbar() {
     fetchStatus();
     const interval = setInterval(fetchStatus, 30_000);
     return () => clearInterval(interval);
+  }, []);
+
+  // Baixa os snapshots estáticos quando o navegador fica ocioso. Assim a
+  // troca Desarmes ↔ Faltas ↔ Finalização usa memória e abre imediatamente.
+  useEffect(() => {
+    const start = () => void warmRankingTabs();
+    const win = window as Window & {
+      requestIdleCallback?: (callback: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    if (win.requestIdleCallback) {
+      const id = win.requestIdleCallback(start, { timeout: 2_500 });
+      return () => win.cancelIdleCallback?.(id);
+    }
+    const id = window.setTimeout(start, 1_200);
+    return () => window.clearTimeout(id);
   }, []);
 
   async function handleScrape() {

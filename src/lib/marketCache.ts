@@ -10,10 +10,11 @@ interface CacheEntry {
 }
 
 const store = new Map<string, CacheEntry>();
-// TTL curto: após scrape o ranking precisa atualizar sem hard refresh
-const TTL_MS = 60_000; // 60s
-// Bump invalida cache client de sessões antigas (evita colunas bet365/betsson e mercado trocado)
-const CACHE_VER = 'v10-bf-3plus';
+// Os snapshots só mudam na coleta. A coleta manual chama invalidateMarket(),
+// então não há motivo para baixar centenas de KB de novo a cada 60 segundos.
+const TTL_MS = 15 * 60_000;
+// Bump: Sofa oficial + prefetch compartilhado entre abas.
+const CACHE_VER = 'v11-sofa-prefetch';
 
 function buildKey(
   market: string,
