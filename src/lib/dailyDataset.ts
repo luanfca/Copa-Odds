@@ -73,7 +73,12 @@ export async function buildDailyDataset(
   // Atualiza a lista de eventos uma única vez por time. Os históricos abaixo
   // reutilizam CacheTeamEvents e CachePlayerStats, evitando jogador x mercado
   // chamadas externas repetidas.
-  await prewarmSofaScoreCache(true);
+  const prewarm = await prewarmSofaScoreCache(true);
+  if (players.length > 0 && prewarm.events === 0) {
+    throw new Error(
+      'SofaScore não retornou eventos; lote anterior mantido para evitar publicar históricos vazios.',
+    );
+  }
 
   let lineupsFound = 0;
   const matchList = Array.from(matches.values());

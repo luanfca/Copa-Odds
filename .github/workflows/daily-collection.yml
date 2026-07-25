@@ -14,17 +14,48 @@ jobs:
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+      AUTO_SCRAPE_ENABLED: "false"
+      PREWARM_ON_START: "false"
+      SOFA_SERVER_URL: http://127.0.0.1:54545
+      SCRAPE_SECRET: ${{ secrets.SCRAPE_SECRET }}
     steps:
-      - name: Acordar o serviço
-        run: curl --fail --silent --show-error --retry 5 --retry-delay 15 --max-time 180 https://copa-odds.onrender.com/api/admin/health
+      - uses: actions/checkout@v4
 
-      - name: Executar lote diário
-        env:
-          SCRAPE_SECRET: ${{ secrets.SCRAPE_SECRET }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Instalar aplicação
+        run: npm ci
+
+      - name: Instalar Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Instalar e iniciar SofaScore
         run: |
-          test -n "$SCRAPE_SECRET"
-          curl --fail --silent --show-error \
-            --max-time 5100 \
-            --request POST \
-            --header "x-scrape-key: $SCRAPE_SECRET" \
-            https://copa-odds.onrender.com/api/scrape
+          python3 -m pip install --disable-pip-version-check -r docker/requirements-sofa.txt
+          python3 -m gunicorn \
+            --chdir scripts \
+            --bind 127.0.0.1:54545 \
+            --workers 1 \
+            --threads 4 \
+            --timeout 90 \
+            sofascore_server:app > /tmp/sofascore.log 2>&1 &
+          for attempt in {1..30}; do
+            curl --fail --silent http://127.0.0.1:54545/health && break
+            sleep 1
+          done
+
+      - name: Sincronizar banco
+        run: npx prisma db push --skip-generate
+
+      - name: Executar lote diário completo
+        run: npm run scrape
+
+      - name: Mostrar log do SofaScore em caso de falha
+        if: failure()
+        run: tail -n 300 /tmp/sofascore.log || true

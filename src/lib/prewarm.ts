@@ -13,6 +13,11 @@ import { getTeamFinishedEvents } from './sofascoreStats';
 
 const CONCURRENCY = 8; // 8 times em paralelo (não sobrecarrega o Python server)
 let prewarmDone = false;
+export interface PrewarmResult {
+  teams: number;
+  events: number;
+}
+let lastPrewarmResult: PrewarmResult = { teams: 0, events: 0 };
 
 /**
  * Pré-aquecimento principal: busca eventos de todos os times do banco.
@@ -22,9 +27,9 @@ let prewarmDone = false;
  * para evitar execuções concorrentes. Se o processo falhar no meio, o cache
  * fica parcialmente populado, mas as requisições reais completam o que faltar.
  */
-export async function prewarmSofaScoreCache(force = false): Promise<void> {
+export async function prewarmSofaScoreCache(force = false): Promise<PrewarmResult> {
   if (force) prewarmDone = false;
-  if (prewarmDone) return;
+  if (prewarmDone) return lastPrewarmResult;
   prewarmDone = true; // trava reentrância imediatamente
 
   try {
@@ -46,7 +51,8 @@ export async function prewarmSofaScoreCache(force = false): Promise<void> {
     const teamList = Array.from(teams);
     if (teamList.length === 0) {
       console.log(`[PREWARM] Nenhum time encontrado (banco vazio?).`);
-      return;
+      lastPrewarmResult = { teams: 0, events: 0 };
+      return lastPrewarmResult;
     }
 
     console.log(`[PREWARM] ${teamList.length} times para pre-aquecer (concorrencia=${CONCURRENCY})...`);
@@ -79,10 +85,13 @@ export async function prewarmSofaScoreCache(force = false): Promise<void> {
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`[PREWARM] Completo! ${teamList.length} times, ${cached} eventos em ${elapsed}s.`);
+    lastPrewarmResult = { teams: teamList.length, events: cached };
+    return lastPrewarmResult;
   } catch (err) {
     console.error('[PREWARM] Erro no pre-aquecimento:', String(err));
     // Se falhou, permite re-tentar no proximo refresh
     prewarmDone = false;
+    return { teams: 0, events: 0 };
   }
 }
 
