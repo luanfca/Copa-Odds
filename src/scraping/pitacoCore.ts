@@ -173,10 +173,10 @@ export function parseWsOdds(buf: Uint8Array): Record<string, OddsValue> {
 				if (!looksMsg(raw)) continue
 				const node = decode(raw)
 				const id = str(node, 1)
-				const odds = sub(node, 2)
-				if (id && /^7\d{14,}$/.test(id) && odds) {
-					const rawOdd = str(odds, 1)
-					const display = str(odds, 3)
+				const oddsNode = sub(node, 2)
+				if (id && /^7\d{14,}$/.test(id) && oddsNode) {
+					const rawOdd = str(oddsNode, 1)
+					const display = str(oddsNode, 3)
 					if (rawOdd && /^\d+$/.test(rawOdd) && display) {
 						map[id] = { value: parseInt(rawOdd, 10) / 1_000_000, display }
 					}
@@ -225,7 +225,7 @@ export function parseTabContent(buf: Uint8Array, targetMarkets?: Set<string>): P
 				const outLabel = strPath(line, [2, 2, 1])
 				const statusId = str(sub(line, 2), 3)
 				if (outcomeId && /^7\d{14,}$/.test(outcomeId)) {
-					lines.push({ line: label, outcomeId, label: outLabel, statusId })
+					lines.push({ line: label!, outcomeId: outcomeId!, label: outLabel, statusId })
 				}
 			}
 			if (lines.length) results.push({ market: marketName, player, team, lines })

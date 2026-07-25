@@ -1,0 +1,28 @@
+{
+  "name": "Brasileirão Odds — Desarmes ao Vivo",
+  "short_name": "Odds AO VIVO",
+  "description": "Agregue e compare odds de desarmes, faltas, finalizações e chutes ao gol por jogador nos jogos do Brasileirão Série A.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#060b15",
+  "theme_color": "#10b981",
+  "categories": ["sports", "finance", "utilities"],
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [],
+  "related_applications": [],
+  "prefer_related_applications": false
+}

@@ -1,0 +1,42 @@
+{
+	email {$ACME_EMAIL}
+	admin off
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Proteção provisória para o MVP. Depois será substituída por contas
+	# individuais e controle de assinatura dentro da aplicação.
+	basic_auth {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_PASSWORD_HASH}
+	}
+
+	# WebSocket publicado sob o mesmo domínio e certificado HTTPS.
+	@websocket path /ws /ws/*
+	reverse_proxy @websocket app:3002
+
+	# O navegador nunca recebe os segredos. Caddy injeta os cabeçalhos apenas
+	# depois que o usuário passou pela autenticação básica.
+	@protected_api path /api/scrape /api/scrape/* /api/admin/*
+	reverse_proxy @protected_api app:3000 {
+		header_up X-Scrape-Key {$SCRAPE_SECRET}
+		header_up X-Admin-Key {$ADMIN_SECRET}
+	}
+
+	reverse_proxy app:3000
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

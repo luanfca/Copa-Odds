@@ -39,6 +39,8 @@ import type { ScrapedMatch } from '@/types/scraping';
 const SCRAPE_SECRET = process.env.SCRAPE_SECRET ?? '';
 
 function isAuthorized(request: Request): boolean {
+  const isProd = process.env.NODE_ENV === 'production';
+  if (isProd && !SCRAPE_SECRET) return false;
   if (!SCRAPE_SECRET) return true;
   return request.headers.get('x-scrape-key') === SCRAPE_SECRET;
 }

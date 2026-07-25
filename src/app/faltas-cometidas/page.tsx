@@ -6,11 +6,28 @@ import {
   Footprints, RefreshCw, Search, Trophy, ChevronDown, ChevronUp,
   Minus, Activity, ArrowRight, Star, Users, BarChart3, Zap, Filter,
 } from 'lucide-react';
-import { cn, formatOdd, HOUSE_LABELS, HOUSE_COLORS } from '@/lib/utils';
+import { cn, formatOdd, HOUSE_LABELS, HOUSE_COLORS, ALL_HOUSES } from '@/lib/utils';
 import { Flag } from '@/components/Flag';
 import { PlayerAvatar } from '@/components/PlayerAvatar';
-import { getCachedMarket, setCachedMarket, invalidateMarket } from '@/lib/marketCache';
+import { SofaScoreStats } from '@/components/SofaScoreStats';
+import { MatchGameFilter } from '@/components/MatchGameFilter';
+import {
+  buildUniqueMatches,
+  filterMatchesByTeam,
+  matchIncludesTeam,
+  normSearch,
+} from '@/lib/matchFilter';
+import { invalidateMarket } from '@/lib/marketCache';
+import { useRankingLoad } from '@/lib/useRankingHistory';
 import type { OddEntry } from '@/lib/arbitrage';
+import {
+  competitionBadgeClass,
+  competitionShort,
+  formatUpdatedAgo,
+  useMarketFavorites,
+  useNow,
+  useRankingFilters,
+} from '@/lib/rankingUi';
 
 interface HistoryStat {
   entries: { date: string; opponent: string; value: number; minutes: number | null }[];
@@ -32,7 +49,7 @@ interface PlayerResult {
   displayName: string;
   team: string;
   matchId: string;
-  match: { id: string; homeTeam: string; awayTeam: string; homeFlag: string | null; awayFlag: string | null; dateTime: string; stage: string };
+  match: { id: string; homeTeam: string; awayTeam: string; homeFlag: string | null; awayFlag: string | null; dateTime: string; stage: string; competition?: string };
   isStarter: boolean;
   odds: OddEntry[];
   bestByLine: Record<string, OddEntry>;
@@ -54,69 +71,55 @@ const LINE_COLORS: Record<string, string> = {
   '4+': 'text-amber-400 bg-amber-500/10 border-amber-500/25',
 };
 
-const HOUSES: Array<'betfair' | 'betmgm' | 'superbet' | 'pitaco'> = ['betfair', 'betmgm', 'superbet', 'pitaco'];
+const HOUSES = ALL_HOUSES;
 
 export default function FaltasCometidasPage() {
-  const [players, setPlayers] = useState<PlayerResult[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
-  const [selectedLine, setSelectedLine] = useState<string>('2+');
-  const [onlyStarters, setOnlyStarters] = useState(false);
-  const [sortField, setSortField] = useState<'avg' | 'bestOdd' | 'name'>('avg');
-  const [sortDir, setSortDir] = useState<'desc' | 'asc'>('desc');
   const [selectedMatch, setSelectedMatch] = useState<string>('Todos');
-  const [minAvg, setMinAvg] = useState<number>(0);
+  const [teamQuery, setTeamQuery] = useState('');
   const [allComps, setAllComps] = useState(false);
+  const [year, setYear] = useState<number>(new Date().getFullYear());
+  const {
+    selectedLine, setSelectedLine,
+    onlyStarters, setOnlyStarters,
+    minAvg, setMinAvg,
+    sortField, setSortField,
+    sortDir, setSortDir,
+    maxGames, setMaxGames,
+    historyScope, setHistoryScope,
+  } = useRankingFilters('faltas_cometidas', { selectedLine: '2+' });
+  const { toggleFavorite, isFavorite } = useMarketFavorites('faltas_cometidas');
+  const now = useNow();
 
   const PAGE = 50;
   const [visibleCount, setVisibleCount] = useState(PAGE);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
 
-  const load = useCallback(async () => {
-    const cached = getCachedMarket('faltas_cometidas', allComps) as ApiResponse | null;
-    if (cached) {
-      setPlayers(cached.players ?? []);
-      setLoading(false);
-      return;
-    }
-    setLoading(true);
-    setError(null);
-    try {
-      const params = new URLSearchParams({ market: 'faltas_cometidas' });
-      if (allComps) params.set('allComps', 'true');
-      const res = await fetch(`/api/desarmes?${params}`, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`Erro ${res.status}`);
-      const data: ApiResponse = await res.json();
-      setCachedMarket('faltas_cometidas', data, allComps);
-      setPlayers(data.players ?? []);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [allComps]);
+  const { players, loading, error, historyMeta, historyLoading, builtAt, dataUpdatedAt, load } = useRankingLoad({
+    market: 'faltas_cometidas',
+    cacheKey: `faltas_cometidas_${historyScope}`,
+    allComps,
+    maxGames,
+    year,
+    historyScope,
+  });
+  const updatedLabel = formatUpdatedAgo(builtAt ?? dataUpdatedAt, now);
 
-  useEffect(() => { load(); }, [load]);
-
-  const uniqueMatches = useMemo(() => {
-    const map = new Map<string, { id: string; label: string }>();
-    for (const p of players) {
-      if (!map.has(p.matchId)) {
-        map.set(p.matchId, {
-          id: p.matchId,
-          label: `${p.match.homeTeam} vs ${p.match.awayTeam}`,
-        });
-      }
-    }
-    return Array.from(map.values());
-  }, [players]);
+  const uniqueMatches = useMemo(
+    () => buildUniqueMatches(players as PlayerResult[]),
+    [players],
+  );
 
   const filtered = useMemo(() => {
-    let list = players;
+    let list = players as PlayerResult[];
 
     if (selectedMatch !== 'Todos') {
       list = list.filter((p) => p.matchId === selectedMatch);
+    } else if (teamQuery.trim()) {
+      const allowed = new Set(
+        filterMatchesByTeam(uniqueMatches, teamQuery).map((m) => m.id),
+      );
+      list = list.filter((p) => allowed.has(p.matchId));
     }
 
     if (onlyStarters) {
@@ -128,14 +131,12 @@ export default function FaltasCometidasPage() {
     }
 
     if (search.trim()) {
-      const q = search.toLowerCase();
-      list = list.filter(
-        (p) =>
-          p.displayName.toLowerCase().includes(q) ||
-          p.team.toLowerCase().includes(q) ||
-          p.match.homeTeam.toLowerCase().includes(q) ||
-          p.match.awayTeam.toLowerCase().includes(q)
-      );
+      const q = normSearch(search);
+      list = list.filter((p) => {
+        if (normSearch(p.displayName).includes(q)) return true;
+        if (normSearch(p.team).includes(q)) return true;
+        return matchIncludesTeam(p.match.homeTeam, p.match.awayTeam, search);
+      });
     }
 
     list = list.filter((p) => {
@@ -144,6 +145,8 @@ export default function FaltasCometidasPage() {
     });
 
     return [...list].sort((a, b) => {
+      // 1º: critério escolhido (média / odd / nome) — junta BR + MLS
+      // 2º: horário do jogo só como desempate
       let valA: number | string;
       let valB: number | string;
 
@@ -162,11 +165,14 @@ export default function FaltasCometidasPage() {
 
       if (valA < valB) return sortDir === 'asc' ? -1 : 1;
       if (valA > valB) return sortDir === 'asc' ? 1 : -1;
-      return 0;
-    });
-  }, [players, search, selectedLine, onlyStarters, sortField, sortDir, selectedMatch, minAvg]);
 
-  useEffect(() => { setVisibleCount(PAGE); }, [search, selectedLine, onlyStarters, sortField, sortDir, selectedMatch, minAvg]);
+      const tA = Date.parse(a.match?.dateTime || '') || 0;
+      const tB = Date.parse(b.match?.dateTime || '') || 0;
+      return tA - tB;
+    });
+  }, [players, search, selectedLine, onlyStarters, sortField, sortDir, selectedMatch, minAvg, teamQuery, uniqueMatches]);
+
+  useEffect(() => { setVisibleCount(PAGE); }, [search, selectedLine, onlyStarters, sortField, sortDir, selectedMatch, minAvg, teamQuery]);
 
   useEffect(() => {
     const el = sentinelRef.current;
@@ -220,8 +226,19 @@ export default function FaltasCometidasPage() {
               <span className="bg-clip-text text-transparent bg-gradient-to-r from-amber-400 via-orange-400 to-red-500">FALTAS COMETIDAS</span>
             </h1>
             <p className="text-xs text-muted-foreground/50 max-w-md leading-relaxed">
-              Jogadores ranqueados por média de faltas cometidas nos últimos jogos da Copa, com as melhores odds disponíveis.
+              Jogadores ranqueados por média de faltas cometidas nos últimos jogos, com as melhores odds disponíveis.
             </p>
+            {!loading && !error && (builtAt || dataUpdatedAt) && (
+              <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground/40 flex items-center gap-1.5">
+                <Activity className="w-3 h-3" />
+                Atualizado {updatedLabel}
+                {historyLoading && (
+                  <span className="text-amber-400/70 normal-case tracking-normal font-medium">
+                    · carregando histórico…
+                  </span>
+                )}
+              </p>
+            )}
           </div>
 
           {!loading && !error && players.length > 0 && (
@@ -249,10 +266,21 @@ export default function FaltasCometidasPage() {
         </div>
       </div>
 
+      {/* SofaScore Stats Ao Vivo */}
+      {!loading && !error && uniqueMatches.length > 0 && (
+        <div className="max-w-md">
+          {(() => {
+            const m = players[0]?.match;
+            if (!m) return null;
+            return <SofaScoreStats homeTeam={m.homeTeam} awayTeam={m.awayTeam} date={m.dateTime?.slice(0, 10)} highlight="faltas_cometidas" />;
+          })()}
+        </div>
+      )}
+
       {/* Filters */}
       {!loading && !error && (
         <div className="p-4 rounded-2xl border border-white/[0.04] bg-white/[0.015]">
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
             <div className="space-y-2">
               <label className="text-[10px] font-black uppercase tracking-[0.15em] text-muted-foreground/40 flex items-center gap-1.5">
                 <Search className="w-3 h-3" /> Buscar
@@ -260,7 +288,7 @@ export default function FaltasCometidasPage() {
               <div className="relative">
                 <input
                   type="text"
-                  placeholder="Jogador ou seleção..."
+                  placeholder="Jogador ou time (casa/fora)..."
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
                   className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 pl-8 text-xs text-foreground placeholder:text-muted-foreground/30 focus:outline-none focus:ring-1 focus:ring-amber-500/30 transition-all"
@@ -291,21 +319,13 @@ export default function FaltasCometidasPage() {
               </div>
             </div>
 
-            <div className="space-y-2">
-              <label className="text-[10px] font-black uppercase tracking-[0.15em] text-muted-foreground/40 flex items-center gap-1.5">
-                <Trophy className="w-3 h-3" /> Jogo
-              </label>
-              <select
-                value={selectedMatch}
-                onChange={(e) => setSelectedMatch(e.target.value)}
-                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-foreground appearance-none cursor-pointer focus:outline-none focus:ring-1 focus:ring-amber-500/30 transition-all"
-              >
-                <option value="Todos">Todos os jogos</option>
-                {uniqueMatches.map((m) => (
-                  <option key={m.id} value={m.id}>{m.label}</option>
-                ))}
-              </select>
-            </div>
+            <MatchGameFilter
+              matches={uniqueMatches}
+              selectedMatch={selectedMatch}
+              onSelectMatch={setSelectedMatch}
+              teamQuery={teamQuery}
+              onTeamQueryChange={setTeamQuery}
+            />
 
             <div className="space-y-2">
               <label className="text-[10px] font-black uppercase tracking-[0.15em] text-muted-foreground/40 flex items-center gap-1.5">
@@ -319,6 +339,46 @@ export default function FaltasCometidasPage() {
                 <option value="avg">Maior Média</option>
                 <option value="bestOdd">Melhor Odd</option>
                 <option value="name">Nome (A-Z)</option>
+              </select>
+            </div>
+
+            {/* Max Games */}
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-[0.15em] text-muted-foreground/40 flex items-center gap-1.5">
+                <BarChart3 className="w-3 h-3" /> Últimos jogos
+              </label>
+              <select
+                value={historyScope}
+                onChange={(e) => setHistoryScope(e.target.value as 'league' | 'all')}
+                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-foreground appearance-none cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30 transition-all mb-2"
+              >
+                <option value="league">Só a liga (BR / MLS)</option>
+                <option value="all">Todos os jogos (Liberta…)</option>
+              </select>
+              <select
+                value={maxGames}
+                onChange={(e) => setMaxGames(Number(e.target.value))}
+                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-foreground appearance-none cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30 transition-all"
+              >
+                {[3, 5, 8, 10].map((n) => (
+                  <option key={n} value={n}>{n} jogos</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Year */}
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-[0.15em] text-muted-foreground/40 flex items-center gap-1.5">
+                <Trophy className="w-3 h-3" /> Temporada
+              </label>
+              <select
+                value={year}
+                onChange={(e) => setYear(Number(e.target.value))}
+                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-foreground appearance-none cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30 transition-all"
+              >
+                {[2026, 2025, 2024].map((y) => (
+                  <option key={y} value={y}>{y}</option>
+                ))}
               </select>
             </div>
           </div>
@@ -336,7 +396,7 @@ export default function FaltasCometidasPage() {
                 )}
               >
                 <Star className={cn('w-3 h-3', onlyStarters && 'fill-amber-400')} />
-                Titulares apenas
+                Escalação prevista
               </button>
 
               <div className="flex items-center gap-2">
@@ -365,12 +425,12 @@ export default function FaltasCometidasPage() {
                 )}
               >
                 <span className="text-xs">🏆</span>
-                Todas as fases da Copa
+                Todos os campeonatos
               </button>
             </div>
 
             <button
-              onClick={() => { invalidateMarket('faltas_cometidas'); load(); }}
+              onClick={() => { invalidateMarket('faltas_cometidas'); load(true); }}
               className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[11px] font-bold text-muted-foreground/40 hover:text-foreground/60 border border-white/[0.06] hover:border-white/[0.1] transition-all"
             >
               <RefreshCw className="w-3 h-3" /> Reload
@@ -390,7 +450,7 @@ export default function FaltasCometidasPage() {
       {error && (
         <div className="flex flex-col items-center justify-center py-20 gap-4 rounded-3xl border border-white/[0.04] bg-white/[0.01]">
           <p className="text-red-400 font-semibold text-sm">{error}</p>
-          <button onClick={load} className="btn-secondary text-xs gap-2">
+          <button onClick={() => load()} className="btn-secondary text-xs gap-2">
             <RefreshCw className="w-3 h-3" /> Tentar Novamente
           </button>
         </div>
@@ -411,7 +471,7 @@ export default function FaltasCometidasPage() {
       )}
 
       {!loading && !error && filtered.length > 0 && (
-        <div className="hidden lg:grid lg:grid-cols-[40px_260px_70px_1fr_100px] gap-3 px-4 items-center">
+        <div className="hidden lg:grid lg:grid-cols-[40px_minmax(200px,260px)_44px_70px_1fr_100px] gap-3 px-4 items-center">
           <span className="text-[10px] font-black uppercase tracking-widest text-muted-foreground/40">#</span>
           <button
             onClick={() => toggleSort('name')}
@@ -419,6 +479,7 @@ export default function FaltasCometidasPage() {
           >
             Jogador <SortIcon field="name" />
           </button>
+          <span className="text-[10px] font-black uppercase tracking-widest text-muted-foreground/40 text-center">Liga</span>
           <button
             onClick={() => toggleSort('avg')}
             className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest text-muted-foreground/70 hover:text-foreground transition-colors"
@@ -446,7 +507,15 @@ export default function FaltasCometidasPage() {
       {!loading && !error && (
         <div className="space-y-2">
           {filtered.slice(0, visibleCount).map((player, idx) => (
-            <PlayerRow key={`${player.id}_${selectedLine}`} player={player} index={idx} line={selectedLine} />
+            <PlayerRow
+              key={`${player.id}_${selectedLine}`}
+              player={player}
+              index={idx}
+              line={selectedLine}
+              favorite={isFavorite(player.displayName)}
+              onToggleFavorite={toggleFavorite}
+              showLeague
+            />
           ))}
         </div>
       )}
@@ -465,10 +534,25 @@ export default function FaltasCometidasPage() {
   );
 }
 
-function PlayerRow({ player, index, line }: { player: PlayerResult; index: number; line: string }) {
+function PlayerRow({
+  player,
+  index,
+  line,
+  favorite,
+  onToggleFavorite,
+  showLeague,
+}: {
+  player: PlayerResult;
+  index: number;
+  line: string;
+  favorite: boolean;
+  onToggleFavorite: (name: string) => void;
+  showLeague: boolean;
+}) {
   const { displayName, team, match, isStarter, odds, bestByLine, history, analysis } = player;
   const bestOdd = bestByLine[line];
   const [expanded, setExpanded] = useState(false);
+  const competition = match?.competition;
 
   const oddMap = useMemo(() => {
     const map = new Map<string, OddEntry>();
@@ -490,7 +574,7 @@ function PlayerRow({ player, index, line }: { player: PlayerResult; index: numbe
       style={{ animationFillMode: 'forwards' }}
     >
       <div
-        className="p-3 sm:p-4 flex flex-col lg:grid lg:grid-cols-[40px_260px_70px_1fr_100px] gap-3 lg:gap-3 items-start lg:items-center cursor-pointer"
+        className="p-3 sm:p-4 flex flex-col lg:grid lg:grid-cols-[40px_minmax(200px,260px)_44px_70px_1fr_100px] gap-3 lg:gap-3 items-start lg:items-center cursor-pointer"
         onClick={() => setExpanded((v) => !v)}
       >
         <div className="hidden lg:flex items-center justify-center">
@@ -508,9 +592,35 @@ function PlayerRow({ player, index, line }: { player: PlayerResult; index: numbe
           <div className="flex flex-col min-w-0">
             <div className="flex items-center gap-1.5">
               <span className="font-bold text-foreground/90 text-sm truncate">{displayName}</span>
+              <button
+                type="button"
+                title={favorite ? 'Remover dos favoritos' : 'Adicionar aos favoritos'}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleFavorite(displayName);
+                }}
+                className={cn(
+                  'shrink-0 p-0.5 rounded transition-colors',
+                  favorite
+                    ? 'text-amber-400 hover:text-amber-300'
+                    : 'text-muted-foreground/25 hover:text-amber-400/80',
+                )}
+              >
+                <Star className={cn('w-3.5 h-3.5', favorite && 'fill-amber-400')} />
+              </button>
               {isStarter && (
-                <span title="Provável titular" className="text-amber-400 shrink-0">
-                  <Star className="w-3 h-3 fill-amber-400" />
+                <span title="Provável titular" className="text-emerald-400 shrink-0 text-[9px] font-black uppercase tracking-wider">
+                  XI
+                </span>
+              )}
+              {showLeague && competition && (
+                <span
+                  className={cn(
+                    'lg:hidden shrink-0 px-1.5 py-0.5 rounded border text-[9px] font-black tracking-wide',
+                    competitionBadgeClass(competition),
+                  )}
+                >
+                  {competitionShort(competition)}
                 </span>
               )}
               <ChevronDown className={cn('w-3 h-3 text-muted-foreground/30 transition-transform', expanded && 'rotate-180')} />
@@ -528,7 +638,7 @@ function PlayerRow({ player, index, line }: { player: PlayerResult; index: numbe
             </div>
             {history && history.entries.length > 0 && (
               <div className="flex items-center gap-1 mt-1">
-                {history.entries.slice(-6).map((e, i) => {
+                {history.entries.slice(-10).map((e, i) => {
                   const hit = lineTarget > 0 && e.value >= lineTarget;
                   return (
                     <span
@@ -551,6 +661,22 @@ function PlayerRow({ player, index, line }: { player: PlayerResult; index: numbe
               </div>
             )}
           </div>
+        </div>
+
+        <div className="hidden lg:flex items-center justify-center">
+          {showLeague && competition ? (
+            <span
+              className={cn(
+                'px-1.5 py-0.5 rounded border text-[9px] font-black tracking-wide',
+                competitionBadgeClass(competition),
+              )}
+              title={competition}
+            >
+              {competitionShort(competition)}
+            </span>
+          ) : (
+            <span className="text-muted-foreground/20 text-[10px]">—</span>
+          )}
         </div>
 
         <div className="hidden lg:block">

@@ -6,6 +6,10 @@
 // reaproveitado entre todos os jogadores daquele jogo.
 
 import {
+  COMP_DEFAULT_CLUBS,
+  COMP_BRASILEIRAO,
+  COMP_SERIEB,
+  COMP_MLS,
   COMP_WC,
   baseParams,
   isNameMatch,
@@ -13,12 +17,16 @@ import {
   teamSlugMatch,
   webwsJson,
 } from './lineups365';
+import { COMPETITIONS } from './competitions';
 
 /** type da stat no 365scores para cada mercado da nossa app. */
 export const MARKET_STAT_TYPE: Record<string, number> = {
   desarmes: 39,
   faltas_cometidas: 42,
   faltas_sofridas: 37,
+  // Chutes / finalizações (tipos comuns no payload de lineup do 365scores)
+  finalizacao: 44,
+  chutes_ao_gol: 45,
 };
 
 const MINUTES_TYPE = 30;
@@ -50,8 +58,9 @@ export function parseStatTotal(raw: unknown): number | null {
   return parseStatNumber(raw);
 }
 
-// Quais tipos de stat usam o total de tentativas (denominador) em vez do 1º número
-const TOTAL_STAT_TYPES = new Set([39]); // 39 = desarmes ("8/12" -> 12 = tentativas)
+// Tipos que usavam o denominador de "X/Y" (tentativas). Mercado de desarmes
+// nas casas costuma ser desarmes efetuados (numerador) — NÃO usar o total.
+const TOTAL_STAT_TYPES = new Set<number>(); // vazio: sempre preferir o 1º número
 
 function fmtDate(d: Date): string {
   const dd = String(d.getUTCDate()).padStart(2, '0');
@@ -74,27 +83,12 @@ interface FinGame {
 const FIN_TTL = 30 * 60_000;
 let finCache: { value: FinGame[]; t: number } | null = null;
 
-export async function getFinishedGames(): Promise<FinGame[]> {
-  if (finCache && Date.now() - finCache.t < FIN_TTL) return finCache.value;
-
-  const now = Date.now();
-  const byId = new Map<string, FinGame>();
-
-  // Busca todos os jogos em uma única janela de 37 dias (de hoje - 35 até hoje + 2)
-  const start = new Date(now - 35 * 86_400_000);
-  const end = new Date(now + 2 * 86_400_000);
-
-  const data = await webwsJson(
-    '/web/games/?' +
-      baseParams({
-        competitions: COMP_WC,
-        startDate: fmtDate(start),
-        endDate: fmtDate(end),
-        showOdds: 'false',
-      }),
-  );
-
-  for (const g of data?.games ?? []) {
+/**
+ * A API /web/games do 365scores zera o retorno se a janela for > ~30 dias.
+ * Por isso varremos em fatias de 28 dias e por competição (multi-ID também falha).
+ */
+function ingestFinishedGames(byId: Map<string, FinGame>, games: any[]): void {
+  for (const g of games ?? []) {
     const finished =
       g?.statusGroup === 4 || /fim|encerr|final/i.test(String(g?.statusText ?? ''));
     if (!finished) continue;
@@ -109,38 +103,81 @@ export async function getFinishedGames(): Promise<FinGame[]> {
       start: g.startTime ?? '',
     });
   }
+}
+
+export async function getFinishedGames(): Promise<FinGame[]> {
+  if (finCache && Date.now() - finCache.t < FIN_TTL) return finCache.value;
+
+  const now = Date.now();
+  const byId = new Map<string, FinGame>();
+  // Brasileirão A + B + MLS, IDs 365scores atuais (113/116/104)
+  const comps = COMP_DEFAULT_CLUBS.split(',').filter(Boolean);
+  // ~90 dias em janelas de 28 (limite prático da API)
+  const windows = rollingWindows(90, 28);
+
+  await Promise.all(
+    comps.flatMap((comp) =>
+      windows.map(async ({ start, end }) => {
+        try {
+          const data = await webwsJson(
+            '/web/games/?' +
+              baseParams({
+                competitions: comp,
+                startDate: start,
+                endDate: end,
+                showOdds: 'false',
+                onlyMajorGames: 'false',
+              }),
+          );
+          ingestFinishedGames(byId, data?.games ?? []);
+        } catch {
+          /* ignora falha de uma janela */
+        }
+      }),
+    ),
+  );
 
   const value = Array.from(byId.values()).sort((a, b) => (a.start < b.start ? -1 : 1));
   finCache = { value, t: now };
   return value;
 }
 
-// ─── Todos os jogos de seleções 2026 (Copa + Amistosos) ───────────
+// ─── Jogos de clubes em várias competições (Brasileirão + MLS + outras) ───
 
 const FIN_ALL_TTL = 30 * 60_000;
 let finAllCache: { value: FinGame[]; t: number } | null = null;
+
+function rollingWindows(daysBack: number, windowDays = 28): Array<{ start: string; end: string }> {
+  const now = Date.now();
+  const out: Array<{ start: string; end: string }> = [];
+  for (let offset = 0; offset < daysBack; offset += windowDays) {
+    const end = new Date(now - offset * 86_400_000);
+    const start = new Date(end.getTime() - windowDays * 86_400_000);
+    out.push({ start: fmtDate(start), end: fmtDate(end) });
+  }
+  return out;
+}
 
 export async function getFinishedGamesAllComps(): Promise<FinGame[]> {
   if (finAllCache && Date.now() - finAllCache.t < FIN_ALL_TTL) return finAllCache.value;
 
   const byId = new Map<string, FinGame>();
+  // Competições de clube configuradas (+ WC legado se ainda houver seleção)
+  const clubComps = [
+    COMPETITIONS.brasileirao?.id365 ?? COMP_BRASILEIRAO,
+    COMPETITIONS.serieb?.id365 ?? COMP_SERIEB,
+    COMPETITIONS.mls?.id365 ?? COMP_MLS,
+    COMP_WC,
+  ].filter(Boolean) as string[];
 
-  // Janelas mensais para cada competição (API limita ~31 dias)
-  const windows: Array<{ comp: string; start: string; end: string }> = [
-    // Copa do Mundo (jul)
-    { comp: '5930', start: '01/06/2026', end: '15/06/2026' },
-    { comp: '5930', start: '16/06/2026', end: '30/06/2026' },
-    { comp: '5930', start: '01/07/2026', end: '31/07/2026' },
-    // Amistosos Internacionais de seleções
-    { comp: '570', start: '01/01/2026', end: '28/02/2026' },
-    { comp: '570', start: '01/03/2026', end: '31/03/2026' },
-    { comp: '570', start: '01/04/2026', end: '30/04/2026' },
-    { comp: '570', start: '01/05/2026', end: '31/05/2026' },
-    { comp: '570', start: '01/06/2026', end: '30/06/2026' },
-  ];
+  const windows = rollingWindows(90, 30);
+  const jobs: Array<{ comp: string; start: string; end: string }> = [];
+  for (const comp of clubComps) {
+    for (const w of windows) jobs.push({ comp, ...w });
+  }
 
   await Promise.all(
-    windows.map(async ({ comp, start, end }) => {
+    jobs.map(async ({ comp, start, end }) => {
       try {
         const data = await webwsJson(
           '/web/games/?' +
@@ -149,23 +186,10 @@ export async function getFinishedGamesAllComps(): Promise<FinGame[]> {
               startDate: start,
               endDate: end,
               showOdds: 'false',
+              onlyMajorGames: 'false',
             }),
         );
-        for (const g of data?.games ?? []) {
-          const finished =
-            g?.statusGroup === 4 || /fim|encerr|final/i.test(String(g?.statusText ?? ''));
-          if (!finished) continue;
-          const id = String(g.id);
-          if (byId.has(id)) continue;
-          byId.set(id, {
-            gameId: id,
-            homeSlug: teamSlug(g.homeCompetitor?.name ?? ''),
-            awaySlug: teamSlug(g.awayCompetitor?.name ?? ''),
-            homeName: g.homeCompetitor?.name ?? '',
-            awayName: g.awayCompetitor?.name ?? '',
-            start: g.startTime ?? '',
-          });
-        }
+        ingestFinishedGames(byId, data?.games ?? []);
       } catch { /* ignora falha de uma janela */ }
     }),
   );
@@ -255,57 +279,26 @@ export interface PlayerHistory {
   average: number;
 }
 
+export interface PlayerHistoryOpts {
+  /** Quantidade máxima de jogos recentes (default: todos disponíveis). */
+  maxGames?: number;
+  /** Filtra jogos pelo ano civil (ex: 2026). */
+  year?: number;
+}
+
+/**
+ * Histórico do jogador — **somente SofaScore** (desarmes/faltas/chutes corretos).
+ * O 365scores gerava médias erradas; assinatura mantida para as rotas existentes.
+ */
 export async function getPlayerHistory(
   playerName: string,
   team: string,
   market: string,
   allComps = false,
+  opts?: PlayerHistoryOpts & { competition?: string },
 ): Promise<PlayerHistory | null> {
-  const statType = MARKET_STAT_TYPE[market];
-  if (statType == null) return null;
-
-  const tslug = teamSlug(team);
-  const games = (allComps ? await getFinishedGamesAllComps() : await getFinishedGames()).filter(
-    (g) => teamSlugMatch(g.homeSlug, tslug) || teamSlugMatch(g.awaySlug, tslug),
-  );
-  if (games.length === 0) return null;
-
-  const results = await Promise.all(
-    games.map(async (g): Promise<HistoryEntry | null> => {
-      const homeIsTeam = teamSlugMatch(g.homeSlug, tslug);
-      const opponent = homeIsTeam ? g.awayName : g.homeName;
-      try {
-        const members = await getGameMemberStats(g.gameId);
-        const pool = members.filter((m) => teamSlugMatch(m.teamSlug, tslug));
-        const hit = (pool.length ? pool : members).find((m) => isNameMatch(playerName, m.name));
-        if (!hit) return null; // não estava na escalação/lista do jogo
-
-        // Só conta se o jogador realmente entrou em campo. Reserva não utilizado
-        // tem 0 minutos (ou ausente) → descarta.
-        const minutes = parseStatNumber(hit.statsByType.get(MINUTES_TYPE));
-        if (minutes != null && minutes <= 0) return null;
-
-        const raw = hit.statsByType.get(statType);
-        // Para desarmes (type 39): "3/5 (60%)" -> total=5 (tentativas), não ganhos(3)
-        const value = raw != null
-          ? (TOTAL_STAT_TYPES.has(statType) ? parseStatTotal(raw) ?? 0 : parseStatNumber(raw) ?? 0)
-          : 0;
-        console.log(`[DEBUG] getPlayerHistory ${playerName} game=${g.gameId} statType=${statType} raw=${raw} value=${value}`);
-        return { date: g.start, opponent, value, minutes: minutes ?? null };
-      } catch (err) {
-        return null;
-      }
-    }),
-  );
-
-  const entries = results
-    .filter((e): e is HistoryEntry => e !== null)
-    .sort((a, b) => (a.date < b.date ? -1 : 1));
-  if (entries.length === 0) return null;
-
-  const total = entries.reduce((s, e) => s + e.value, 0);
-  const average = total / entries.length;
-  return { market, entries, total, average };
+  const { getPlayerHistory: getSofaHistory } = await import('./sofascoreStats');
+  return getSofaHistory(playerName, team, market, allComps, opts);
 }
 
 // ─── Histórico de TIME (soma de todos os jogadores por jogo) ──────────────

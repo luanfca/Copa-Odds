@@ -5,7 +5,7 @@ import {
   TrendingUp, TrendingDown, Minus, BarChart2,
   ChevronDown, ChevronUp, Star,
 } from 'lucide-react';
-import { cn, formatOdd, HOUSE_LABELS, HOUSE_COLORS } from '@/lib/utils';
+import { cn, formatOdd, HOUSE_LABELS, HOUSE_COLORS, ALL_HOUSES } from '@/lib/utils';
 import { type OddEntry } from '@/lib/arbitrage';
 import { OddHistoryModal } from './OddHistoryModal';
 import { PlayerAvatar } from './PlayerAvatar';
@@ -46,7 +46,7 @@ interface PlayerLineRow {
   history?: HistoryStat | null;
 }
 
-const HOUSES: Array<'betfair' | 'betmgm' | 'superbet' | 'pitaco'> = ['betfair', 'betmgm', 'superbet', 'pitaco'];
+const HOUSES = ALL_HOUSES;
 const LINES = ['1+', '2+', '3+', '4+'];
 
 const LINE_COLORS: Record<string, string> = {

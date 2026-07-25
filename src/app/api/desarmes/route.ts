@@ -1,47 +1,279 @@
-import { NextRequest, NextResponse } from 'next/server';
+﻿import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { getPlayerHistory } from '@/lib/playerStats365';
-import { SHARED_HISTORY_CACHE } from '@/lib/sharedCache';
 import { computeProbableStarterIds } from '@/lib/starters';
 import { getStartersForMatch } from '@/lib/lineups365';
 import { findBestOdds, type OddEntry } from '@/lib/arbitrage';
-import { isLikelyPlayerName } from '@/lib/normalize';
-import { computeLineAnalysis } from '@/lib/poisson';
+import { isLikelyPlayerName, isSamePlayer } from '@/lib/normalize';
+import {
+  attachFullHistory,
+  scheduleHistoryEnrich,
+  enrichJobKey,
+  getEnrichJobStatus,
+  isHistoryCoverageOk,
+} from '@/lib/historyEnrich';
+import { applyRegularStarters } from '@/lib/starters';
+import { applyPredictedLineups } from '@/lib/lineups365';
+
+import { desCache, DES_TTL } from '@/lib/cacheInvalidation';
+import { broadcastScrapeError } from '@/lib/ws-server';
+import {
+  getApiSnapshot,
+  getApiSnapshotWithAge,
+  setApiSnapshot,
+  rankingSnapshotKey,
+  buildLightRanking,
+  SNAPSHOT_MAX_AGE_MS,
+} from '@/lib/apiSnapshot';
 
 export const dynamic = 'force-dynamic';
 
-const CACHE_VERSION = 'v3-desarmes';
-function hKey(team: string, name: string, market: string, allComps: boolean) {
-  return `${CACHE_VERSION}::${team}::${name}::${market}::${allComps ? 'all' : 'wc'}`;
+/** Preserva history/analysis de um snapshot anterior ao reconstruir odds (light). */
+function mergeHistoryFromPrev(light: any, prev: any): any {
+  if (!light?.players?.length || !prev?.players?.length) return light;
+  const prevByKey = new Map<string, any>();
+  for (const p of prev.players) {
+    if (p?.history?.entries?.length) {
+      prevByKey.set(`${p.team || ''}::${p.displayName}`, p);
+      prevByKey.set(`::${p.displayName}`, p);
+    }
+  }
+  for (const p of light.players) {
+    if (p.history?.entries?.length) continue;
+    const hit =
+      prevByKey.get(`${p.team || ''}::${p.displayName}`) ||
+      prevByKey.get(`::${p.displayName}`);
+    if (hit?.history) {
+      p.history = hit.history;
+      if (hit.analysis) p.analysis = hit.analysis;
+    }
+  }
+  return light;
 }
 
-const DES_TTL = 60_000;
-let desCache: { body: any; t: number; allComps: boolean } | null = null;
+function withHistoryMeta(
+  body: any,
+  filled: number,
+  missing: number,
+  resolved: number,
+  job: ReturnType<typeof getEnrichJobStatus>,
+) {
+  const total = filled + missing;
+  // Job terminou ⇒ cobertura ok mesmo se alguns sem dados no 365
+  const coverageOk =
+    (job?.done === true) || isHistoryCoverageOk(filled, total, resolved);
+  return {
+    ...body,
+    historyMeta: {
+      filled,
+      missing,
+      resolved,
+      total,
+      coverageOk,
+      job,
+    },
+  };
+}
 
-/** Invalida o cache server-side. Chamado após nova coleta. */
-export function invalidateDesCache(): void {
-  desCache = null;
+async function prepareBodyWithHistory(
+  body: any,
+  market: string,
+  allComps: boolean,
+  maxGames: number | undefined,
+  year: number | undefined,
+  competition: string | undefined,
+  startJob: boolean,
+  historyScope: 'league' | 'all' = 'league',
+) {
+  const sanitized = body;
+  // historyScope=all → Liberta + copas; league → só BR ou só MLS
+  const scope: 'league' | 'all' = historyScope === 'all' ? 'all' : 'league';
+  const histAllComps = scope === 'all';
+  const compFilter = competition && competition !== 'all' ? competition : undefined;
+  const jobKey = enrichJobKey(market, histAllComps, compFilter, year, scope);
+  const cap = maxGames && maxGames > 0 ? Math.min(maxGames, 10) : 10;
+
+  const first = await attachFullHistory(
+    sanitized?.players ?? [],
+    market,
+    histAllComps,
+    cap,
+    year,
+    scope,
+    compFilter,
+  );
+
+  // Job barato se o SQLite já tem o histórico (só atualiza com jogo novo)
+  if (startJob && sanitized?.players?.length) {
+    scheduleHistoryEnrich(
+      jobKey,
+      sanitized.players,
+      market,
+      histAllComps,
+      year,
+      compFilter,
+      scope,
+    );
+  }
+
+  const again = await attachFullHistory(
+    sanitized?.players ?? [],
+    market,
+    histAllComps,
+    cap,
+    year,
+    scope,
+    compFilter,
+  );
+
+  if (Array.isArray(sanitized?.players) && sanitized.players.length) {
+    // 1) Fallback: quem mais joga (histórico) — útil se não houver escalação
+    applyRegularStarters(sanitized.players);
+    // 2) Primário: escalação PREVISTA/confirmada do 365scores (XI de cada time)
+    try {
+      await applyPredictedLineups(sanitized.players, 10_000);
+    } catch {
+      /* mantém heurística de regulares */
+    }
+  }
+
+  const job = getEnrichJobStatus(jobKey);
+  return withHistoryMeta(sanitized, again.filled, again.missing, again.resolved, job);
 }
 
 export async function GET(request: NextRequest) {
   const url = new URL(request.url);
   const forceRefresh = url.searchParams.has('refresh');
+  // enrich/history: o job roda em background; a resposta sempre anexa o que já tiver no cache
   const market = url.searchParams.get('market') ?? 'desarmes';
   const allComps = url.searchParams.get('allComps') === 'true';
+  const competition = url.searchParams.get('competition') ?? undefined;
+  const maxGamesRaw = url.searchParams.has('maxGames')
+    ? parseInt(url.searchParams.get('maxGames')!)
+    : 10;
+  const maxGames = Number.isFinite(maxGamesRaw)
+    ? Math.min(Math.max(maxGamesRaw || 10, 1), 10)
+    : 10;
+  const year = url.searchParams.has('year') ? parseInt(url.searchParams.get('year')!) : undefined;
+  // league (default) = só BR/MLS | all = todos os jogos (Liberta etc.)
+  const historyScopeParam = url.searchParams.get('historyScope');
+  const historyScope: 'league' | 'all' =
+    historyScopeParam === 'all' ? 'all' : 'league';
 
-  if (!forceRefresh && desCache && Date.now() - desCache.t < DES_TTL && desCache.allComps === allComps) {
-    return NextResponse.json(desCache.body);
+  const cacheKey = `${market}_${allComps}_${competition || 'all'}_${maxGames}_${year ?? 'cur'}_${historyScope}`;
+  const snapKey = rankingSnapshotKey(market, allComps, competition);
+
+  const ACTIVE = new Set(['betfair', 'betmgm', 'superbet', 'pitaco']);
+  function sanitizeRankingBody(body: any) {
+    if (!body?.players) return body;
+    return {
+      ...body,
+      players: body.players
+        .map((p: any) => {
+          const odds = (p.odds || []).filter((o: any) => ACTIVE.has(o.house));
+          if (odds.length === 0) return null;
+          // recalcula bestByLine só com casas ativas
+          const bestByLine: Record<string, any> = {};
+          for (const o of odds) {
+            if (!bestByLine[o.line] || o.value > bestByLine[o.line].value) bestByLine[o.line] = o;
+          }
+          // NÃO remove history/analysis — só limpa casas inativas nas odds
+          return { ...p, odds, bestByLine };
+        })
+        .filter(Boolean),
+    };
+  }
+
+  // 1) Snapshot fresco / memória / rebuild light do banco
+  //    Snapshot >90s → reconstrói do SQLite (evita sumir Coritiba×Palmeiras
+  //    depois de scrape parcial ou escalação saindo e cache velho).
+  if (!forceRefresh) {
+    const snapMeta = await getApiSnapshotWithAge(snapKey);
+    if (snapMeta && snapMeta.ageMs < SNAPSHOT_MAX_AGE_MS) {
+      const body = await prepareBodyWithHistory(
+        sanitizeRankingBody(snapMeta.data),
+        market,
+        allComps,
+        maxGames,
+        year,
+        competition,
+        /* startJob */ true,
+        historyScope,
+      );
+      return NextResponse.json(body, {
+        headers: {
+          'Cache-Control': 'public, s-maxage=15, stale-while-revalidate=30',
+          'X-Cache': 'SNAPSHOT',
+          'X-Snapshot-Age-Ms': String(Math.round(snapMeta.ageMs)),
+        },
+      });
+    }
+
+    const cached = desCache.get(cacheKey);
+    // Memória curta (45s) — ranking pré-jogo muda com scrape/escalação
+    if (
+      cached &&
+      Date.now() - cached.t < 45_000 &&
+      cached.allComps === allComps
+    ) {
+      const body = await prepareBodyWithHistory(
+        sanitizeRankingBody(cached.body),
+        market,
+        allComps,
+        maxGames,
+        year,
+        competition,
+        true,
+        historyScope,
+      );
+      return NextResponse.json(body, { headers: { 'X-Cache': 'MEMORY' } });
+    }
+
+    try {
+      const prev = snapMeta?.data ?? (await getApiSnapshot(snapKey));
+      let light = sanitizeRankingBody(await buildLightRanking(market, allComps, competition));
+      light = mergeHistoryFromPrev(light, prev);
+      const body = await prepareBodyWithHistory(
+        light,
+        market,
+        allComps,
+        maxGames,
+        year,
+        competition,
+        true,
+        historyScope,
+      );
+      await setApiSnapshot(snapKey, 'ranking', {
+        players: body.players,
+        market: body.market,
+        mock: body.mock,
+        builtAt: body.builtAt,
+      });
+      desCache.set(cacheKey, { body, t: Date.now(), allComps });
+      return NextResponse.json(body, {
+        headers: {
+          'Cache-Control': 'public, s-maxage=15, stale-while-revalidate=30',
+          'X-Cache': 'BUILT-LIGHT',
+        },
+      });
+    } catch {
+      // cai no path completo abaixo
+    }
   }
 
   try {
-    const lastScrape = await prisma.scrapeLog.findFirst({
-      where: { status: { in: ['success', 'partial'] } },
-      orderBy: { finishedAt: 'desc' },
-    });
+    // Janela fixa de 48h: mostra odds de todos os scrapes recentes,
+    // independente de qual scrape as coletou.
+    // ANTES usava o startedAt do último scrape, o que fazia odds de
+    // scrapes anteriores sumirem quando um novo scrape rodava.
+    const timeThreshold = new Date(Date.now() - 48 * 60 * 60 * 1000);
 
-    const timeThreshold = lastScrape?.startedAt
-      ? lastScrape.startedAt
-      : new Date(Date.now() - 4 * 60 * 60 * 1000);
+    // Filtra por competition se especificado
+    const matchFilter: any = {};
+    if (competition) {
+      matchFilter.competition = competition;
+    }
+
+    const hasCompetitionFilter = Object.keys(matchFilter).length > 0;
 
     const players = await prisma.player.findMany({
       include: {
@@ -53,8 +285,13 @@ export async function GET(request: NextRequest) {
       },
     });
 
+    // Filtra jogadores por competition apÃ³s buscar (mais seguro que relation filter)
+    const filteredPlayers = hasCompetitionFilter
+      ? players.filter((p) => p.match?.competition === competition)
+      : players;
+
     const starterIds = computeProbableStarterIds(
-      players
+      filteredPlayers
         .filter((p) => p.snapshots.length > 0)
         .map((p) => ({
           playerId: p.id,
@@ -66,8 +303,8 @@ export async function GET(request: NextRequest) {
         })),
     );
 
-    const matchById = new Map<string, (typeof players)[number]['match']>();
-    for (const p of players) {
+    const matchById = new Map<string, (typeof filteredPlayers)[number]['match']>();
+    for (const p of filteredPlayers) {
       if (p.snapshots.length > 0 && !matchById.has(p.matchId)) {
         matchById.set(p.matchId, p.match);
       }
@@ -81,10 +318,10 @@ export async function GET(request: NextRequest) {
           startersByMatch.set(matchId, ms);
         })
       ),
-      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+      new Promise<void>((resolve) => setTimeout(resolve, 5000)),
     ]);
 
-    const isProbableStarter = (player: (typeof players)[number]): boolean => {
+    const isProbableStarter = (player: (typeof filteredPlayers)[number]): boolean => {
       const ms = startersByMatch.get(player.matchId);
       if (ms) return ms.isStarter(player.displayName || player.name, player.team);
       return starterIds.has(player.id);
@@ -95,6 +332,8 @@ export async function GET(request: NextRequest) {
       superbet: 'https://superbet.bet.br',
       betfair: 'https://www.betfair.bet.br',
       bet365: 'https://www.bet365.bet.br',
+      betsson: 'https://www.betsson.bet.br',
+      pitaco: 'https://pitaco.bet.br',
     };
 
     interface PlayerResult {
@@ -102,7 +341,7 @@ export async function GET(request: NextRequest) {
       displayName: string;
       team: string;
       matchId: string;
-      match: { id: string; homeTeam: string; awayTeam: string; homeFlag: string | null; awayFlag: string | null; dateTime: string; stage: string };
+      match: { id: string; homeTeam: string; awayTeam: string; homeFlag: string | null; awayFlag: string | null; dateTime: string; stage: string; competition?: string };
       isStarter: boolean;
       odds: OddEntry[];
       bestByLine: Record<string, OddEntry>;
@@ -112,7 +351,7 @@ export async function GET(request: NextRequest) {
 
     const results: PlayerResult[] = [];
 
-    for (const player of players) {
+    for (const player of filteredPlayers) {
       if (player.snapshots.length === 0) continue;
       if (!isLikelyPlayerName(player.displayName || player.name)) continue;
 
@@ -124,12 +363,15 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      const odds: OddEntry[] = Array.from(latestByHouseLine.values()).map((s) => ({
-        house: s.house as OddEntry['house'],
-        line: s.line,
-        value: s.value,
-        url: s.url ?? HOUSE_FALLBACK[s.house] ?? undefined,
-      }));
+      const ACTIVE = new Set(['betfair', 'betmgm', 'superbet', 'pitaco']);
+      const odds: OddEntry[] = Array.from(latestByHouseLine.values())
+        .filter((s) => ACTIVE.has(s.house))
+        .map((s) => ({
+          house: s.house as OddEntry['house'],
+          line: s.line,
+          value: s.value,
+          url: s.url ?? HOUSE_FALLBACK[s.house] ?? undefined,
+        }));
 
       if (odds.length === 0) continue;
 
@@ -148,6 +390,7 @@ export async function GET(request: NextRequest) {
           awayFlag: player.match.awayFlag,
           dateTime: player.match.dateTime.toISOString(),
           stage: player.match.stage,
+          competition: player.match.competition,
         },
         isStarter: isProbableStarter(player),
         odds,
@@ -156,68 +399,92 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Busca histórico de desarmes para cada jogador (em paralelo, com limite)
-    const uniquePlayers = new Map<string, (typeof results)[0]>();
+    // DEDUPLICAÃ‡ÃƒO: mescla jogadores duplicados do banco (ex: "J. Arias" + "Jhon Arias")
+    // que foram criados por scrapes anteriores antes da correÃ§Ã£o do matchKey.
+    // Usa isSamePlayer da lib normalize (fuzzy match por sobrenome + inicial + Levenshtein).
+    // O dedup Ã© feito ANTES do uniquePlayers para evitar buscar histÃ³rico duplicado.
+    const deduped: PlayerResult[] = [];
     for (const r of results) {
-      const key = `${r.team}::${r.displayName}`;
-      if (!uniquePlayers.has(key)) uniquePlayers.set(key, r);
-    }
-
-    await Promise.race([
-      Promise.all(
-        Array.from(uniquePlayers.values()).map(async (r) => {
-          const cacheKey = hKey(r.team, r.displayName, market, allComps);
-          const cached = SHARED_HISTORY_CACHE.get(cacheKey);
-          if (cached) {
-            r.history = { entries: cached.entries, total: cached.total, average: cached.average };
-          } else {
-            const h = await getPlayerHistory(r.displayName, r.team, market, allComps);
-            if (h !== null) {
-              SHARED_HISTORY_CACHE.set(cacheKey, h);
-              r.history = { entries: h.entries, total: h.total, average: h.average };
+      let merged = false;
+      for (const existing of deduped) {
+        // SÃ³ mescla no mesmo match E mesmo time (evita fundir dois jogadores
+        // diferentes com mesmo nome em times opostos)
+        const sameTeam = !existing.team || !r.team || existing.team === r.team;
+        if (existing.matchId === r.matchId && sameTeam && isSamePlayer(existing.displayName, r.displayName)) {
+          // Mescla odds do duplicado no existente (mantÃ©m maior odd por casa+linha)
+          for (const odd of r.odds) {
+            const exists = existing.odds.find(o => o.house === odd.house && o.line === odd.line);
+            if (!exists) {
+              existing.odds.push(odd);
+            } else if (odd.value > exists.value) {
+              exists.value = odd.value;
+              if (odd.url) exists.url = odd.url;
             }
           }
-        })
-      ),
-      new Promise<void>((resolve) => setTimeout(resolve, 60000)),
-    ]);
-
-    // Atualiza history do cache para todos os resultados duplicados
-    for (const r of results) {
-      if (r.history === null) {
-        const cacheKey = hKey(r.team, r.displayName, market, allComps);
-        const cached = SHARED_HISTORY_CACHE.get(cacheKey);
-        if (cached) r.history = { entries: cached.entries, total: cached.total, average: cached.average };
+          // Recalcula bestByLine via findBestOdds (jÃ¡ importado)
+          existing.bestByLine = Object.fromEntries(findBestOdds(existing.odds)) as Record<string, OddEntry>;
+          // MantÃ©m o displayName mais longo (mais completo)
+          if (r.displayName.length > existing.displayName.length) {
+            existing.displayName = r.displayName;
+          }
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) {
+        deduped.push(r);
       }
     }
+    results.length = 0;
+    results.push(...deduped);
+
+    // Histórico: cache full (15) + job em background — NÃO bloqueia 180s
+    // (trocar de aba / abrir outra página não cancela o job do servidor)
+    const bodyBase = {
+      players: results,
+      market,
+      mock: false,
+      builtAt: new Date().toISOString(),
+    };
+    const body = await prepareBodyWithHistory(
+      bodyBase,
+      market,
+      allComps,
+      maxGames,
+      year,
+      competition,
+      true,
+      historyScope,
+    );
 
     // Ordena por média de desarmes (decrescente), depois por melhor odd
     function bestOddValue(r: (typeof results)[0]): number {
       return Math.max(...r.odds.map((o) => o.value), 0);
     }
-
-    results.sort((a, b) => {
+    body.players.sort((a: any, b: any) => {
       const avgA = a.history?.average ?? 0;
       const avgB = b.history?.average ?? 0;
-      if (avgB !== avgA) return bestOddValue(b) - bestOddValue(a);
+      if (avgB !== avgA) return avgB - avgA;
       return bestOddValue(b) - bestOddValue(a);
     });
 
-    // Adiciona análise de Poisson (odd justa + EV) para cada jogador
-    const LINES = ['1+', '2+', '3+', '4+'];
-    for (const r of results) {
-      const avg = r.history?.average ?? 0;
-      const bestByLine: Record<string, number> = {};
-      for (const l of LINES) {
-        bestByLine[l] = r.bestByLine[l]?.value ?? 0;
-      }
-      r.analysis = computeLineAnalysis(avg, LINES, bestByLine);
-    }
+    desCache.set(cacheKey, { body, t: Date.now(), allComps });
+    await setApiSnapshot(snapKey, 'ranking', {
+      players: body.players,
+      market: body.market,
+      mock: false,
+      builtAt: body.builtAt,
+    }).catch(() => null);
 
-    const body = { players: results, market, mock: false };
-    desCache = { body, t: Date.now(), allComps };
-    return NextResponse.json(body);
+    return NextResponse.json(body, {
+      headers: {
+        'Cache-Control': 'public, s-maxage=15, stale-while-revalidate=60',
+        'X-Cache': 'FULL-LIGHT-HIST',
+      },
+    });
   } catch (error) {
+    broadcastScrapeError(String(error))
     return NextResponse.json({ error: 'Erro ao buscar ranking de desarmes', detail: String(error) }, { status: 500 });
   }
 }
+

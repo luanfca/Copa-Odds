@@ -1,0 +1,71 @@
+name: odds-ao-vivo
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${ORACLE_ENV_FILE:-.env.oracle}
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: 3000
+      WS_PORT: 3002
+      DATABASE_URL: file:/app/data/odds.db
+      SOFA_SERVER_URL: http://sofa:54545
+    volumes:
+      - odds_data:/app/data
+      - browser_sessions:/app/.playwright-sessions
+    expose:
+      - "3000"
+      - "3002"
+    depends_on:
+      sofa:
+        condition: service_healthy
+    restart: unless-stopped
+    init: true
+    ipc: host
+    mem_limit: 8g
+    cpus: 2.0
+
+  sofa:
+    build:
+      context: .
+      dockerfile: docker/sofa.Dockerfile
+    env_file:
+      - ${ORACLE_ENV_FILE:-.env.oracle}
+    environment:
+      SOFA_HOST: 0.0.0.0
+      SOFA_PORT: 54545
+    expose:
+      - "54545"
+    restart: unless-stopped
+    init: true
+    mem_limit: 768m
+    cpus: 0.5
+
+  caddy:
+    image: caddy:2.10-alpine
+    env_file:
+      - ${ORACLE_ENV_FILE:-.env.oracle}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.25
+
+volumes:
+  odds_data:
+  browser_sessions:
+  caddy_data:
+  caddy_config:

@@ -38,15 +38,18 @@ export function flagEmoji(code: string): string {
   };
   if (overrides[code]) return overrides[code];
 
+  // Normaliza código: tenta extrair as 2 primeiras letras maiúsculas
+  const normalized = code.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2);
+  if (normalized.length !== 2) return '🏳️';
+
   // Converte código ISO 2 letras → emoji de bandeira
-  return code
-    .toUpperCase()
+  return normalized
     .split('')
     .map(c => String.fromCodePoint(0x1F1E0 + c.charCodeAt(0) - 65))
     .join('');
 }
 
-/** Nomes de casas em pt-BR */
+/** Nomes de casas em pt-BR (só as 4 ativas) */
 export const HOUSE_LABELS: Record<string, string> = {
   betfair: 'Betfair',
   betmgm: 'BetMGM',
@@ -60,3 +63,19 @@ export const HOUSE_COLORS: Record<string, string> = {
   superbet: '#E84A5F',
   pitaco: '#00C853',
 };
+
+/**
+ * Casas exibidas nas tabelas comparativas.
+ * Só as 4 que de fato coletam: Betfair, BetMGM, Superbet, Pitaco.
+ */
+export const ALL_HOUSES = [
+  'betfair',
+  'betmgm',
+  'superbet',
+  'pitaco',
+] as const;
+
+export type HouseKey = (typeof ALL_HOUSES)[number];
+
+/** Whitelist de casas ativas (API + UI) */
+export const ACTIVE_HOUSES = new Set<string>(ALL_HOUSES);

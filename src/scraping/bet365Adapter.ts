@@ -77,10 +77,33 @@ function determineMarket(marketName: string): string | null {
     return 'faltas_sofridas';
   }
 
+  // Chutes no gol / Shots on target
+  if (
+    lower.includes('chute no gol') ||
+    lower.includes('chute ao gol') ||
+    lower.includes('chutes no gol') ||
+    lower.includes('chutes ao gol') ||
+    lower.includes('shots on target') ||
+    lower.includes('finalizações no gol')
+  ) {
+    return 'chutes_ao_gol';
+  }
+
+  // Finalizações / Chutes = total de finalizações
+  if (
+    lower.includes('finalização') ||
+    lower.includes('finalizac') ||
+    lower.includes('chutes') ||
+    lower.includes('shots') ||
+    lower.includes('total de chutes')
+  ) {
+    return 'finalizacao';
+  }
+
   // Mercados genéricos de jogador que podem ser mapeados
   if (lower.includes('jogador')) {
-    // Tentativa genérica - pode precisar de ajuste fino
-    if (lower.includes('chute') || lower.includes('finalização')) return 'chutes';
+    if (lower.includes('chute no gol') || lower.includes('chute ao gol')) return 'chutes_ao_gol';
+    if (lower.includes('chute') || lower.includes('finalização')) return 'finalizacao';
     if (lower.includes('passe') || lower.includes('assistência')) return 'passes';
     if (lower.includes('desarme') || lower.includes('tackle')) return 'desarmes';
     if (lower.includes('falta')) {
@@ -255,7 +278,7 @@ export async function scrapeBet365(browserContext?: BrowserContext): Promise<Scr
       awayTeam: string;
       dateTime: Date;
       stage: string;
-      odds: Map<string, { market: string; odds: number }>
+      odds: Map<string, number>
     }> = new Map();
 
     let currentMatchKey = '';
@@ -324,7 +347,7 @@ export async function scrapeBet365(browserContext?: BrowserContext): Promise<Scr
               // Em uma implementação mais sofisticada, poderíamos manter todas as odds e deixar o processo de merge decidir
               if (!matchData.odds.has(marketType)) {
                 matchData.odds.set(marketType, decimalOdds);
-              }
+            }
             }
           }
         }

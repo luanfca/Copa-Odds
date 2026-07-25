@@ -1,6 +1,3 @@
-// Prisma schema — Copa Odds
-// Banco: SQLite local (mudar para postgresql:// para produção)
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -10,84 +7,141 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Jogo da Copa do Mundo
 model Match {
-  id        String   @id @default(cuid())
-  dateTime  DateTime
-  homeTeam  String
-  awayTeam  String
-  stage     String   // "Fase de Grupos", "Oitavas", "Quartas", "Semi", "Final"
-  homeFlag  String?  // código ISO do país (ex: "BR", "FR")
-  awayFlag  String?
-  players   Player[]
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          String   @id @default(cuid())
+  dateTime    DateTime
+  homeTeam    String
+  awayTeam    String
+  stage       String
+  competition String   @default("brasileirao")
+  homeFlag    String?
+  awayFlag    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  players     Player[]
 
+  @@unique([homeTeam, awayTeam, dateTime, competition])
+  @@index([dateTime])
+  @@index([competition])
   @@map("matches")
 }
 
-// Jogador presente no mercado de desarmes de um jogo
 model Player {
-  id        String        @id @default(cuid())
-  name      String        // nome normalizado (slug ASCII)
-  displayName String      // nome original para exibição
-  team      String
-  match     Match         @relation(fields: [matchId], references: [id], onDelete: Cascade)
-  matchId   String
-  snapshots OddSnapshot[]
-  createdAt DateTime      @default(now())
+  id          String        @id @default(cuid())
+  name        String
+  displayName String
+  team        String
+  matchId     String
+  createdAt   DateTime      @default(now())
+  snapshots   OddSnapshot[]
+  match       Match         @relation(fields: [matchId], references: [id], onDelete: Cascade)
 
   @@unique([matchId, name])
+  @@index([matchId])
+  @@index([team])
   @@map("players")
 }
 
-// Snapshot de odd coletado a cada execução do scraping
 model OddSnapshot {
   id          String   @id @default(cuid())
-  player      Player   @relation(fields: [playerId], references: [id], onDelete: Cascade)
   playerId    String
-  house       String   // "betfair" | "betmgm" | "superbet"
+  house       String
   market      String   @default("desarmes")
-  line        String   // "1+", "2+", "3+" (número de desarmes)
-  value       Float    // odd decimal (ex: 1.85)
-  url         String?  // URL do jogo na casa de apostas
+  line        String
+  value       Float
+  url         String?
   collectedAt DateTime @default(now())
+  player      Player   @relation(fields: [playerId], references: [id], onDelete: Cascade)
 
   @@index([playerId, house, line])
   @@index([collectedAt])
+  @@index([market, collectedAt])
+  @@index([playerId, collectedAt])
   @@map("odd_snapshots")
 }
 
-// Alertas de odd definidos pelo usuário
 model Alert {
-  id          String   @id @default(cuid())
-  playerName  String?  // null = qualquer jogador
-  minOdd      Float    // limiar mínimo de odd
-  house       String?  // null = qualquer casa
-  line        String?  // null = qualquer linha
-  active      Boolean  @default(true)
-  triggeredAt DateTime? // última vez que foi disparado
+  id          String    @id @default(cuid())
+  playerName  String?
+  minOdd      Float
+  house       String?
+  line        String?
+  active      Boolean   @default(true)
+  triggeredAt DateTime?
   createdAt   DateTime  @default(now())
 
   @@map("alerts")
 }
 
-// Registro de execuções do scraping (para exibir "Atualizado em")
 model ScrapeLog {
-  id          String   @id @default(cuid())
-  startedAt   DateTime @default(now())
+  id          String    @id @default(cuid())
+  startedAt   DateTime  @default(now())
   finishedAt  DateTime?
-  status      String   // "running" | "success" | "partial" | "failed"
-  betfairOk   Boolean  @default(false)
-  betmgmOk    Boolean  @default(false)
-  superbetOk  Boolean  @default(false)
-  bet365Ok    Boolean  @default(false)
-  betssonOk   Boolean  @default(false)
-  pitacoOk    Boolean  @default(false)
+  status      String
+  betfairOk   Boolean   @default(false)
+  betmgmOk    Boolean   @default(false)
+  superbetOk  Boolean   @default(false)
+  bet365Ok    Boolean   @default(false)
+  betssonOk   Boolean   @default(false)
+  pitacoOk    Boolean   @default(false)
   errorMsg    String?
-  matchCount  Int      @default(0)
-  playerCount Int      @default(0)
-  oddCount    Int      @default(0)
+  matchCount  Int       @default(0)
+  playerCount Int       @default(0)
+  oddCount    Int       @default(0)
 
   @@map("scrape_logs")
+}
+
+// ── Cache SQLite para substituir Maps in-memory ──────────────────────────────
+
+model CacheTeamEvents {
+  id        String   @id @default(cuid())
+  cacheKey  String   @unique
+  data      String   // JSON array de SofaTeamEvent[]
+  createdAt DateTime @default(now())
+
+  @@index([cacheKey])
+  @@index([createdAt])
+  @@map("cache_team_events")
+}
+
+model CachePlayerStats {
+  id        String   @id @default(cuid())
+  eventId   Int      @unique
+  data      String   // JSON dos dados de player_stats
+  createdAt DateTime @default(now())
+
+  @@index([eventId])
+  @@map("cache_player_stats")
+}
+
+model CachePlayerHistory {
+  id        String   @id @default(cuid())
+  cacheKey  String   @unique
+  market    String
+  data      String   // JSON de PlayerHistory { market, entries, total, average }
+  createdAt DateTime @default(now())
+
+  @@index([cacheKey])
+  @@index([market])
+  @@index([createdAt])
+  @@map("cache_player_history")
+}
+
+// ── Snapshot das respostas de API (páginas instantâneas) ─────────────────────
+// Após cada scrape, gravamos o JSON pronto de desarmes/faltas/value-odds/matches.
+// As rotas leem daqui primeiro → sem SofaScore, sem recomputar ranking a cada request.
+// No scrape seguinte: apaga tudo e grava de novo.
+
+model ApiSnapshot {
+  id        String   @id @default(cuid())
+  cacheKey  String   @unique // ex: "ranking:desarmes:all" | "value-odds" | "matches"
+  kind      String   // ranking | value-odds | matches | match
+  data      String   // JSON completo da resposta HTTP
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([kind])
+  @@index([updatedAt])
+  @@map("api_snapshots")
 }

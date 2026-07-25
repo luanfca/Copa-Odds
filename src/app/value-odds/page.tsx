@@ -38,7 +38,7 @@ interface Opportunity {
     dateTime: string;
     stage: string;
   };
-  market: 'desarmes' | 'faltas_cometidas' | 'faltas_sofridas';
+  market: string;
   line: string;
   odds: OddEntry[];
   bestOddHouse: 'betfair' | 'betmgm' | 'superbet' | 'pitaco';
@@ -61,13 +61,34 @@ const MARKET_LABELS: Record<string, string> = {
   desarmes: 'Desarmes',
   faltas_cometidas: 'Faltas Cometidas',
   faltas_sofridas: 'Faltas Sofridas',
+  finalizacao: 'Chutes',
+  chutes: 'Chutes',
+  chutes_ao_gol: 'Chutes no Gol',
+  shots: 'Chutes',
+  shots_on_target: 'Chutes no Gol',
 };
 
 const MARKET_ICONS: Record<string, string> = {
   desarmes: '🛡️',
   faltas_cometidas: '⚠️',
   faltas_sofridas: '🤕',
+  finalizacao: '🎯',
+  chutes: '🎯',
+  chutes_ao_gol: '🥅',
+  shots: '🎯',
+  shots_on_target: '🥅',
 };
+
+function marketLabel(market: string): string {
+  const m = (market || '').trim();
+  if (!m) return 'Mercado';
+  return MARKET_LABELS[m] || MARKET_LABELS[m.toLowerCase()] || m.replace(/_/g, ' ');
+}
+
+function marketIcon(market: string): string {
+  const m = (market || '').trim();
+  return MARKET_ICONS[m] || MARKET_ICONS[m.toLowerCase()] || '📊';
+}
 
 // ─── Componente Principal ─────────────────────────────────────────────────────
 
@@ -78,12 +99,15 @@ export default function ValueOddsPage() {
   const [isMock, setIsMock] = useState(false);
 
   // Filtros
-  const [threshold, setThreshold] = useState<number>(50); // padrão 50%
+  const [threshold, setThreshold] = useState<number>(15); // padrão 15% (ver mais jogos)
   const [search, setSearch] = useState<string>('');
   const [marketFilter, setMarketFilter] = useState<string>('Todos');
   const [lineFilter, setLineFilter] = useState<string>('Todos');
-  const [sortBy, setSortBy] = useState<'diffPct' | 'playerName' | 'dateTime'>('diffPct');
+  const [sortBy, setSortBy] = useState<'diffPct' | 'historyAvg' | 'playerName' | 'dateTime'>('diffPct');
   const [onlyStarters, setOnlyStarters] = useState<boolean>(false);
+  const [maxGames, setMaxGames] = useState<number>(5);
+  const [historyScope, setHistoryScope] = useState<'league' | 'all'>('league');
+  const [year, setYear] = useState<number>(new Date().getFullYear());
 
   // Render incremental (scroll infinito): evita montar centenas de cards de uma
   // vez — que era o que travava a aba. Mostramos em lotes.
@@ -104,21 +128,37 @@ export default function ValueOddsPage() {
     });
   }, [opportunities]);
 
-  const load = useCallback(async () => {
-    const cached = getCachedMarket('value-odds', false) as ApiResponse | null;
-    if (cached) {
-      setOpportunities(cached.opportunities ?? []);
-      setIsMock(cached.mock ?? false);
-      setLoading(false);
-      return;
+  const load = useCallback(async (forceRefresh = false) => {
+    if (!forceRefresh) {
+      const cached = getCachedMarket('value-odds', false, {
+        maxGames,
+        year,
+        historyScope,
+      }) as ApiResponse | null;
+      if (cached) {
+        setOpportunities(cached.opportunities ?? []);
+        setIsMock(cached.mock ?? false);
+        setLoading(false);
+        // Se cache sem histórico, revalida em background
+        const missingHist = (cached.opportunities ?? []).some(
+          (o: any) => !o.history?.entries?.length,
+        );
+        if (!missingHist) return;
+      }
     }
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/value-odds', { cache: 'no-store' });
+      const params = new URLSearchParams({
+        maxGames: String(maxGames),
+        year: String(year),
+        historyScope,
+      });
+      if (forceRefresh) params.set('refresh', '1');
+      const res = await fetch(`/api/value-odds?${params}`, { cache: 'no-store' });
       if (!res.ok) throw new Error(`Erro ${res.status}`);
       const data: ApiResponse = await res.json();
-      setCachedMarket('value-odds', data, false);
+      setCachedMarket('value-odds', data, false, { maxGames, year, historyScope });
       setOpportunities(data.opportunities ?? []);
       setIsMock(data.mock ?? false);
     } catch (err) {
@@ -126,7 +166,7 @@ export default function ValueOddsPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [maxGames, year, historyScope]);
 
   useEffect(() => {
     load();
@@ -161,6 +201,12 @@ export default function ValueOddsPage() {
       .sort((a, b) => {
         if (sortBy === 'diffPct') {
           return b.diffPct - a.diffPct;
+        }
+        if (sortBy === 'historyAvg') {
+          const avgA = a.history?.average ?? -1;
+          const avgB = b.history?.average ?? -1;
+          if (avgB !== avgA) return avgB - avgA;
+          return b.diffPct - a.diffPct; // desempate: maior desajuste
         }
         if (sortBy === 'playerName') {
           return a.player.displayName.localeCompare(b.player.displayName);
@@ -253,7 +299,7 @@ export default function ValueOddsPage() {
       {/* ═══ Filters ═══ */}
       {!loading && !error && (
         <div className="p-4 rounded-2xl border border-white/[0.04] bg-white/[0.015]">
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
             {/* Threshold */}
             <div className="space-y-2">
               <label className="text-[10px] font-black uppercase tracking-[0.15em] text-muted-foreground/40 flex items-center gap-1.5">
@@ -301,8 +347,50 @@ export default function ValueOddsPage() {
                 className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-foreground appearance-none cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30 transition-all"
               >
                 <option value="diffPct">Maior Desajuste</option>
+                <option value="historyAvg">Maior Média (histórico)</option>
                 <option value="playerName">Nome (A-Z)</option>
                 <option value="dateTime">Horário</option>
+              </select>
+            </div>
+
+            {/* Escopo do histórico */}
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-[0.15em] text-muted-foreground/40">Histórico</label>
+              <select
+                value={historyScope}
+                onChange={(e) => setHistoryScope(e.target.value as 'league' | 'all')}
+                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-foreground appearance-none cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30 transition-all"
+              >
+                <option value="league">Só a liga (BR / MLS)</option>
+                <option value="all">Todos os jogos (Liberta…)</option>
+              </select>
+            </div>
+
+            {/* Max Games */}
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-[0.15em] text-muted-foreground/40">Últimos jogos</label>
+              <select
+                value={maxGames}
+                onChange={(e) => setMaxGames(Number(e.target.value))}
+                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-foreground appearance-none cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30 transition-all"
+              >
+                {[3, 5, 8, 10].map((n) => (
+                  <option key={n} value={n}>{n} jogos</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Year */}
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-[0.15em] text-muted-foreground/40">Temporada</label>
+              <select
+                value={year}
+                onChange={(e) => setYear(Number(e.target.value))}
+                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-foreground appearance-none cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30 transition-all"
+              >
+                {[2026, 2025, 2024].map((y) => (
+                  <option key={y} value={y}>{y}</option>
+                ))}
               </select>
             </div>
           </div>
@@ -313,8 +401,10 @@ export default function ValueOddsPage() {
               {[
                 { id: 'Todos', label: 'Todos', icon: <Trophy className="w-3 h-3" /> },
                 { id: 'desarmes', label: 'Desarmes', icon: <span className="text-xs">🛡️</span> },
-                { id: 'faltas_cometidas', label: 'Faltas Cometidas', icon: <span className="text-xs">⚠️</span> },
-                { id: 'faltas_sofridas', label: 'Faltas Sofridas', icon: <span className="text-xs">🤕</span> },
+                { id: 'faltas_cometidas', label: 'Faltas', icon: <span className="text-xs">⚠️</span> },
+                { id: 'faltas_sofridas', label: 'Sofreu', icon: <span className="text-xs">🤕</span> },
+                { id: 'finalizacao', label: 'Chutes', icon: <span className="text-xs">🎯</span> },
+                { id: 'chutes_ao_gol', label: 'No gol', icon: <span className="text-xs">🥅</span> },
               ].map(item => (
                 <button
                   key={item.id} onClick={() => setMarketFilter(item.id)}
@@ -348,7 +438,7 @@ export default function ValueOddsPage() {
                 <Star className={cn('w-3 h-3', onlyStarters && 'fill-emerald-400')} />
                 Titulares
               </button>
-              <button onClick={() => { invalidateMarket('value-odds'); load(); }} className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[11px] font-bold text-muted-foreground/40 hover:text-foreground/60 border border-white/[0.06] hover:border-white/[0.1] transition-all">
+              <button onClick={() => { invalidateMarket('value-odds'); load(true); }} className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[11px] font-bold text-muted-foreground/40 hover:text-foreground/60 border border-white/[0.06] hover:border-white/[0.1] transition-all">
                 <RefreshCw className="w-3 h-3" /> Reload
               </button>
             </div>
@@ -409,14 +499,20 @@ function OpportunityCard({ opportunity, index }: { opportunity: Opportunity; ind
       )}
       style={{ animationFillMode: 'forwards' }}
     >
-      {/* Indicador de Desajuste Top */}
-      <div className="flex items-center justify-between mb-4 border-b border-white/5 pb-3">
-        <span className="text-[10px] font-extrabold uppercase tracking-widest text-muted-foreground/60 flex items-center gap-1">
-          {MARKET_ICONS[market]} {MARKET_LABELS[market]} — Linha {line}
+      {/* Indicador de Desajuste Top — sempre com mercado + linha legíveis */}
+      <div className="flex items-center justify-between mb-4 border-b border-white/5 pb-3 gap-2">
+        <span className="inline-flex items-center gap-1.5 min-w-0 rounded-lg border border-white/[0.06] bg-white/[0.03] px-2 py-1">
+          <span className="shrink-0 text-sm leading-none">{marketIcon(market)}</span>
+          <span className="text-[10px] font-extrabold uppercase tracking-wide text-foreground/80 truncate">
+            {marketLabel(market)}
+          </span>
+          <span className="shrink-0 text-[10px] font-black text-primary/90">
+            Linha {line || '—'}
+          </span>
         </span>
-        
+
         {/* Badge de Destaque do Desajuste */}
-        <span className="match-badge border-amber-500/35 bg-amber-500/8 text-amber-400 font-extrabold shadow-sm shadow-amber-500/5 select-none animate-pulse">
+        <span className="match-badge border-amber-500/35 bg-amber-500/8 text-amber-400 font-extrabold shadow-sm shadow-amber-500/5 select-none shrink-0">
           ⚡ +{diffPct.toFixed(0)}%
         </span>
       </div>
@@ -433,26 +529,29 @@ function OpportunityCard({ opportunity, index }: { opportunity: Opportunity; ind
               </span>
             )}
           </h3>
-          <p className="text-[10px] font-bold text-muted-foreground/80 uppercase tracking-wide">
-            {player.team}
+          <p className="text-[10px] font-bold text-muted-foreground/80 uppercase tracking-wide truncate">
+            {player.team || '—'}
+          </p>
+          <p className="text-[10px] font-bold text-primary/80 mt-0.5">
+            {marketIcon(market)} {marketLabel(market)} · {line || '—'}
           </p>
         </div>
       </div>
 
-      {/* Histórico do jogador na Copa (jogos finalizados, via 365scores) */}
+      {/* Histórico do jogador (SofaScore — mesma fonte do ranking) */}
       {history && history.entries.length > 0 ? (
         <div className="bg-white/[0.02] border border-white/5 rounded-2xl px-3 py-2.5 mb-4">
           <div className="flex items-center justify-between mb-2">
             <span className="text-[10px] font-bold tracking-wider text-muted-foreground/50 uppercase flex items-center gap-1.5">
               <Activity className="w-3 h-3" />
-              Histórico na Copa
+              Histórico · {marketLabel(market)}
             </span>
             <span className="text-[9px] font-bold text-muted-foreground/70">
               méd <span className="text-amber-400 font-mono">{history.average.toFixed(1)}</span>
             </span>
           </div>
           <div className="flex items-end gap-1.5 flex-wrap">
-            {history.entries.slice(-6).map((e, i) => {
+            {history.entries.slice(-10).map((e, i) => {
               const hit = lineTarget > 0 && e.value >= lineTarget;
               const mins = e.minutes != null ? `${e.minutes}m` : '';
 
@@ -493,7 +592,7 @@ function OpportunityCard({ opportunity, index }: { opportunity: Opportunity; ind
         <div className="bg-white/[0.01] border border-white/5 rounded-2xl px-3 py-3 mb-4 flex items-center justify-center gap-2">
           <Activity className="w-3.5 h-3.5 text-muted-foreground/30" />
           <span className="text-[10px] font-medium tracking-wide text-muted-foreground/40 uppercase">
-            Sem estatísticas na Copa
+            Sem estatísticas recentes
           </span>
         </div>
       )}

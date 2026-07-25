@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { Calendar, Users, ChevronRight, Zap } from 'lucide-react';
 import { formatDateTime, cn } from '@/lib/utils';
-import { Flag } from '@/components/Flag';
+import { TeamBadge } from '@/components/TeamBadge';
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 
@@ -107,12 +107,8 @@ export function MatchCard({
   isPast    = false,
   index     = 0,
 }: MatchCardProps) {
-  const flagSize  = featured ? 56 : 42;
-  const stageText = KNOCKOUT_STAGES.has(stage) && !isPast
-    ? null // badge já mostra o stage
-    : stage === 'Fase de Grupos' || stage === 'Copa do Mundo 2026'
-    ? stage
-    : stage;
+  const flagSize  = featured ? 60 : 48;
+  const stageText = stage === 'Fase de Grupos' || stage === 'Copa do Mundo 2026' ? stage : null;
 
   return (
     <Link
@@ -243,10 +239,8 @@ function TeamColumn({
   featured: boolean;
 }) {
   return (
-    <div className="flex flex-col items-center gap-3 flex-1 min-w-0">
-      <div className="flag-frame" style={{ width: flagSize + 8, height: flagSize + 8 }}>
-        <Flag code={flag} size={flagSize} title={name} />
-      </div>
+    <div className="flex flex-col items-center gap-2 flex-1 min-w-0">
+      <TeamBadge code={flag} name={name} size={flagSize} title={name} />
       <span className={cn(
         'font-black text-foreground/90 tracking-tight leading-tight w-full text-center truncate',
         featured ? 'text-base' : 'text-xs md:text-sm'

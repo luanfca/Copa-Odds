@@ -55,6 +55,15 @@ describe('normalizeLine', () => {
     expect(normalizeLine('Over 0.5')).toBe('1+');
   });
 
+  test('ranges Betfair (1+ até 3+) não viram linha única 1+', () => {
+    expect(normalizeLine('1+ até 3+')).toBe('');
+    expect(normalizeLine('1+ a 3+')).toBe('');
+    expect(normalizeLine('4+ a 6+')).toBe('');
+    expect(normalizeLine('1+ e 2+')).toBe('');
+    expect(normalizeLine('2+')).toBe('2+');
+    expect(normalizeLine('Jogador tem 2 ou mais Chutes')).toBe('2+');
+  });
+
   test('normaliza padrões de linha 2+', () => {
     expect(normalizeLine('2+ Tackles')).toBe('2+');
     expect(normalizeLine('Mais de 1.5')).toBe('2+');

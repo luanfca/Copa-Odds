@@ -1,11 +1,11 @@
-/**
+﻿/**
  * Adaptador de scraping para Betsson Brasil.
  *
  * Estratégia em camadas:
  * 1. API direta (sem browser) — tenta endpoints internos plausíveis baseados
  *    no padrão de mercado de outras casas (BetMGM/Superbet). Betsson costuma
  *    expor JSON em rotas /api/v1/ ou via CDN.
- * 2. Playwright com stealth — se a API direta falhar ou retornar 0 jogos,
+ * 2. Playwright — se a API direta falhar ou retornar 0 jogos,
  *    abre a SPA AngularJS da Betsson, intercepta respostas XHR com palavras-
  *    chave de desarmes/faltas e extrai odds via DOM/JSON.
  *
@@ -14,8 +14,8 @@
  *  - https://www.betsson.bet.br/api/v2/events?competitionId=...
  *  - https://cdn.betsson.com/events
  *
- * O Betsson BR é uma SPA AngularJS com proteção anti-bot. Por isso o fallback
- * Playwright usa puppeteer-extra-plugin-stealth (já instalado em package.json).
+ * O Betsson BR é uma SPA AngularJS com proteção anti-bot. O fallback usa o
+ * BrowserContext compartilhado do Playwright para manter a sessão do navegador.
  *
  * MUDANÇAS:
  * - Sem `BrowserContext` na assinatura (igual betmgm/superbet) — recebe via parâmetro
@@ -59,8 +59,8 @@ const BASE_HEADERS: Readonly<Record<string, string>> = {
   'Origin': 'https://www.betsson.bet.br',
 };
 
-const BATCH_SIZE = 5;
-const BATCH_DELAY_MS = 500;
+const BATCH_SIZE = 10;
+const BATCH_DELAY_MS = 200;
 
 const delay = (ms: number): Promise<void> =>
   new Promise(resolve => setTimeout(resolve, ms));
@@ -389,6 +389,25 @@ function resolveBetssonMarketKey(marketName: string): string | null {
     lower.includes('faltas sofridas')
   ) return 'faltas_sofridas';
 
+  // Chutes no gol (shots on target)
+  if (
+    lower.includes('chute no gol') ||
+    lower.includes('chute ao gol') ||
+    lower.includes('chutes no gol') ||
+    lower.includes('chutes ao gol') ||
+    lower.includes('shots on target') ||
+    lower.includes('finalizações no gol')
+  ) return 'chutes_ao_gol';
+
+  // Finalizações = total de chutes
+  if (
+    lower.includes('finalização') ||
+    lower.includes('finalizac') ||
+    lower.includes('chutes') ||
+    lower.includes('shots') ||
+    lower.includes('total de chutes')
+  ) return 'finalizacao';
+
   return null;
 }
 
@@ -537,6 +556,9 @@ async function extractBetssonPlayerOdds(
     { search: 'desarmes', market: 'desarmes' },
     { search: 'faltas cometidas', market: 'faltas_cometidas' },
     { search: 'faltas sofridas', market: 'faltas_sofridas' },
+    { search: 'finalizações', market: 'finalizacao' },
+    { search: 'chutes no gol', market: 'chutes_ao_gol' },
+    { search: 'chutes', market: 'finalizacao' },
   ];
 
   for (const section of sections) {

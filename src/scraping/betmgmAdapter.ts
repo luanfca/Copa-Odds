@@ -2,19 +2,13 @@
  * Adaptador de scraping para BetMGM Brasil — via API REST direta.
  *
  * Estratégia (sem browser):
- * 1. Busca jogos da Copa do Mundo via groupId 1820 (Copa do Mundo FIFA 2026).
+ * 1. Busca jogos de múltiplas ligas via groupIds configurados.
  * 2. Para cada lote de eventos, busca mercados de jogador em paralelo.
- * 3. Extrai odds de desarmes, faltas cometidas e faltas sofridas.
+ * 3. Extrai odds de desarmes, faltas, finalizações e chutes.
  *
  * APIs reais descobertas via análise de tráfego:
  * - GET /events?groupIds=1820&...
  * - GET /events?ids={id1,id2}&marketTypes=player-to-make-x-plus-tackles,...
- *
- * MUDANÇAS vs versão anterior:
- * - REMOVIDO: `import { BrowserContext } from 'playwright'` (não era usado)
- * - REMOVIDO: interfaces ScrapedOdd/ScrapedMatch locais → usa src/types/scraping.ts
- * - REMOVIDO: extractStage() local duplicada → usa normalize.ts
- * - MANTIDO: batching de 5 eventos por request (rate limiting da API)
  */
 
 import { logger } from '../lib/logger';
@@ -23,14 +17,30 @@ import type { ScrapedMatch, ScrapedOdd } from '../types/scraping';
 
 // ─── Configuração ─────────────────────────────────────────────────────────────
 
-/** Group ID da Copa do Mundo FIFA 2026 no BetMGM Brasil. */
-const COPA_GROUP_IDS = [1820] as const;
+/** Group IDs por competição no BetMGM Brasil.
+ *
+ * NOTA: A API da BetMGM usa `player-to-have-x-plus-shots` para
+ * finalização (chutes totais), NÃO `player-to-make-x-plus-shots`.
+ * Ambos os tipos precisam estar no MARKET_TYPES para coletar
+ * todos os mercados.
+ */
+const COMPETITION_GROUPS: Record<string, { groupIds: number[]; keywords: string[] }> = {
+  copa: {
+    groupIds: [1820],
+    keywords: ['copa do mundo', 'world cup', 'fifa', 'mundial', 'world cup 2026'],
+  },
+  brasileirao: {
+    groupIds: [1173],
+    keywords: ['brasileirão', 'brasileirao', 'serie a', 'brasil', 'série a'],
+  },
+  mls: {
+    groupIds: [820],
+    keywords: ['mls', 'major league soccer', 'eua', 'usa', 'united states', 'estados unidos'],
+  },
+  // Premier League e La Liga não têm mercados de jogador na BetMGM Brasil
+};
 
 const BETMGM_API_BASE = 'https://br-program-api.goldrush.llc/program/v1/api';
-
-const COPA_KEYWORDS = [
-  'copa do mundo', 'world cup', 'fifa', 'mundial', 'world cup 2026',
-] as const;
 
 const BASE_HEADERS: Readonly<Record<string, string>> = {
   'Accept': 'application/json',
@@ -44,10 +54,14 @@ const MARKET_TYPES = [
   'player-to-make-x-plus-tackles',
   'player-to-commit-x-plus-fouls',
   'player-to-win-x-plus-fouls',
+  'player-to-make-x-plus-shots',
+  'player-to-have-x-plus-shots',
+  'player-to-have-x-plus-shots-on-target',
+  'player-to-make-x-plus-shots-on-target',
 ].join(',');
 
-const BATCH_SIZE = 5;
-const BATCH_DELAY_MS = 500;
+const BATCH_SIZE = 10;
+const BATCH_DELAY_MS = 200;
 
 const delay = (ms: number): Promise<void> =>
   new Promise(resolve => setTimeout(resolve, ms));
@@ -58,32 +72,43 @@ const delay = (ms: number): Promise<void> =>
  * Ponto de entrada do scraping BetMGM.
  *
  * Fluxo:
- * 1. Descobre IDs dos jogos da Copa do Mundo via groupId.
+ * 1. Descobre IDs dos jogos de múltiplas ligas via groupIds.
  * 2. Processa em lotes de BATCH_SIZE para não sobrecarregar a API.
- * 3. Cada lote busca mercados de jogador (desarmes + faltas) em uma única request.
+ * 3. Cada lote busca mercados de jogador (desarmes, faltas, finalizações).
+ *
+ * @param competitionKeys - Chaves das competições para buscar (ex: ['premier_league', 'la_liga']).
+ * Se vazio, busca todas as competições configuradas.
  */
-export async function scrapeBetMGM(): Promise<ScrapedMatch[]> {
+export async function scrapeBetMGM(competitionKeys?: string[]): Promise<ScrapedMatch[]> {
   logger.info('[BetMGM] Iniciando scraping direto via API...');
   const results: ScrapedMatch[] = [];
 
   try {
-    let eventIds = await fetchCopaEventIds();
-    logger.info(`[BetMGM] ${eventIds.length} jogos da Copa encontrados.`);
+    // Determina quais competições buscar
+    const compsToScrape = competitionKeys?.length
+      ? competitionKeys.filter(k => COMPETITION_GROUPS[k])
+      : Object.keys(COMPETITION_GROUPS);
 
-    if (eventIds.length === 0) {
-      logger.warn('[BetMGM] Nenhum jogo encontrado via groupId. Usando IDs de fallback...');
-      // IDs de fallback para quando a API de grupos não retornar nada.
-      // Mantidos apenas como última linha de defesa — a API de grupos é a fonte primária.
-      eventIds = [1078314, 585046, 1481340, 1486313, 1487326, 1489531, 1481746, 1486716, 1486742, 1473537];
-    }
+    for (const compKey of compsToScrape) {
+      const comp = COMPETITION_GROUPS[compKey];
+      logger.info(`[BetMGM] Buscando eventos da competição: ${compKey}`);
 
-    for (let i = 0; i < eventIds.length; i += BATCH_SIZE) {
-      const batch = eventIds.slice(i, i + BATCH_SIZE);
-      const batchMatches = await fetchPlayerMarketsForEvents(batch);
-      results.push(...batchMatches);
+      let eventIds = await fetchEventIdsForCompetition(comp.groupIds, comp.keywords, compKey);
+      logger.info(`[BetMGM] ${compKey}: ${eventIds.length} jogos encontrados.`);
 
-      const hasMore = i + BATCH_SIZE < eventIds.length;
-      if (hasMore) await delay(BATCH_DELAY_MS);
+      if (eventIds.length === 0) {
+        logger.warn(`[BetMGM] ${compKey}: Nenhum jogo encontrado via groupId.`);
+        continue;
+      }
+
+      for (let i = 0; i < eventIds.length; i += BATCH_SIZE) {
+        const batch = eventIds.slice(i, i + BATCH_SIZE);
+        const batchMatches = await fetchPlayerMarketsForEvents(batch, compKey);
+        results.push(...batchMatches);
+
+        const hasMore = i + BATCH_SIZE < eventIds.length;
+        if (hasMore) await delay(BATCH_DELAY_MS);
+      }
     }
 
   } catch (error) {
@@ -96,11 +121,15 @@ export async function scrapeBetMGM(): Promise<ScrapedMatch[]> {
 
 // ─── Funções internas ─────────────────────────────────────────────────────────
 
-/** Descobre IDs dos jogos da Copa do Mundo buscando nos grupos configurados. */
-async function fetchCopaEventIds(): Promise<number[]> {
+/** Descobre IDs dos jogos buscando nos grupos configurados para uma competição. */
+async function fetchEventIdsForCompetition(
+  groupIds: number[],
+  keywords: string[],
+  competitionKey: string,
+): Promise<number[]> {
   const eventIds: number[] = [];
 
-  for (const groupId of COPA_GROUP_IDS) {
+  for (const groupId of groupIds) {
     try {
       const url = new URL(`${BETMGM_API_BASE}/events`);
       url.searchParams.set('groupIds', String(groupId));
@@ -126,16 +155,16 @@ async function fetchCopaEventIds(): Promise<number[]> {
         if (!ev?.id || typeof ev.id !== 'number') continue;
 
         const leagueName: string = (ev.leagueName ?? ev.group?.name ?? '').toLowerCase();
-        const isWorldCup =
-          COPA_KEYWORDS.some(kw => leagueName.includes(kw)) ||
-          COPA_GROUP_IDS.includes(groupId);
+        const matchesCompetition =
+          keywords.some(kw => leagueName.includes(kw)) ||
+          groupIds.includes(groupId);
 
-        if (isWorldCup && !eventIds.includes(ev.id)) {
+        if (matchesCompetition && !eventIds.includes(ev.id)) {
           eventIds.push(ev.id);
         }
       }
 
-      logger.info(`[BetMGM] Grupo ${groupId}: ${events.length} eventos, ${eventIds.length} da Copa.`);
+      logger.info(`[BetMGM] Grupo ${groupId} (${competitionKey}): ${events.length} eventos, ${eventIds.length} filtrados.`);
     } catch (err) {
       logger.warn(`[BetMGM] Erro ao buscar grupo ${groupId}:`, { error: String(err) });
     }
@@ -144,8 +173,8 @@ async function fetchCopaEventIds(): Promise<number[]> {
   return eventIds;
 }
 
-/** Busca mercados de jogador (desarmes e faltas) para um lote de IDs de eventos. */
-async function fetchPlayerMarketsForEvents(eventIds: number[]): Promise<ScrapedMatch[]> {
+/** Busca mercados de jogador (desarmes, faltas, finalizações) para um lote de IDs de eventos. */
+async function fetchPlayerMarketsForEvents(eventIds: number[], competitionKey: string): Promise<ScrapedMatch[]> {
   if (eventIds.length === 0) return [];
 
   const url = new URL(`${BETMGM_API_BASE}/events`);
@@ -168,7 +197,7 @@ async function fetchPlayerMarketsForEvents(eventIds: number[]): Promise<ScrapedM
     const events = data?.data ?? [];
 
     return events
-      .map(extractMatchFromEvent)
+      .map(ev => extractMatchFromEvent(ev, competitionKey))
       .filter((m): m is ScrapedMatch => m !== null);
 
   } catch (err) {
@@ -180,6 +209,17 @@ async function fetchPlayerMarketsForEvents(eventIds: number[]): Promise<ScrapedM
 /** Resolve o marketKey a partir do tipo e nome do mercado. */
 function resolveMarketKey(mType: string, mName: string): string {
   const lower = mName.toLowerCase();
+  // Desarmes / tackles (tinha sumido: type existia no request mas nunca mapeava)
+  if (
+    mType === 'player-to-make-x-plus-tackles' ||
+    mType === 'player-to-have-x-plus-tackles' ||
+    lower.includes('desarme') ||
+    lower.includes('tackle') ||
+    lower.includes('abordagem')
+  ) {
+    return 'desarmes';
+  }
+
   if (
     mType === 'player-to-commit-x-plus-fouls' ||
     lower.includes('faltas cometidas') ||
@@ -193,12 +233,31 @@ function resolveMarketKey(mType: string, mName: string): string {
     lower.includes('faltas ganhas')
   ) return 'faltas_sofridas';
 
-  return 'desarmes';
+  if (
+    mType === 'player-to-have-x-plus-shots-on-target' ||
+    mType === 'player-to-make-x-plus-shots-on-target' ||
+    lower.includes('chute no gol') ||
+    lower.includes('chute ao gol') ||
+    lower.includes('chutes no gol') ||
+    lower.includes('shots on target')
+  ) return 'chutes_ao_gol';
+
+  if (
+    mType === 'player-to-make-x-plus-shots' ||
+    mType === 'player-to-have-x-plus-shots' ||
+    lower.includes('finalização') ||
+    lower.includes('finalizac') ||
+    (lower.includes('chutes') && !lower.includes('gol')) ||
+    (lower.includes('shots') && !lower.includes('target'))
+  ) return 'finalizacao';
+
+  return '';
 }
 
-/** Resolve o time de um jogador cruzando com a lista de participantes. */
+/** Resolve o time de um jogador cruzando com a lista de participantes.
+ *  Sem match → string vazia (NÃO assume casa: isso marcava visitante como home). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function resolvePlayerTeam(playerName: string, participants: any[], homeTeam: string): string {
+function resolvePlayerTeam(playerName: string, participants: any[], _homeTeam: string): string {
   for (const participant of participants) {
     if (!Array.isArray(participant.players)) continue;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -209,14 +268,14 @@ function resolvePlayerTeam(playerName: string, participants: any[], homeTeam: st
         (pl.name?.toLowerCase() ?? '') === playerName.toLowerCase()
       );
     });
-    if (found) return participant.name ?? homeTeam;
+    if (found) return String(participant.name ?? '').trim();
   }
-  return homeTeam;
+  return '';
 }
 
 /** Extrai os dados de um evento da API e retorna um ScrapedMatch ou null. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function extractMatchFromEvent(ev: any): ScrapedMatch | null {
+function extractMatchFromEvent(ev: any, competitionKey: string): ScrapedMatch | null {
   if (!ev || typeof ev !== 'object') return null;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -233,8 +292,15 @@ function extractMatchFromEvent(ev: any): ScrapedMatch | null {
     m.type === 'player-to-make-x-plus-tackles' ||
     m.type === 'player-to-commit-x-plus-fouls' ||
     m.type === 'player-to-win-x-plus-fouls' ||
+    m.type === 'player-to-make-x-plus-shots' ||
+    m.type === 'player-to-have-x-plus-shots' ||
+    m.type === 'player-to-have-x-plus-shots-on-target' ||
+    m.type === 'player-to-make-x-plus-shots-on-target' ||
     (m.name ?? '').toLowerCase().includes('desarme') ||
-    (m.name ?? '').toLowerCase().includes('falta'),
+    (m.name ?? '').toLowerCase().includes('falta') ||
+    (m.name ?? '').toLowerCase().includes('finalização') ||
+    (m.name ?? '').toLowerCase().includes('chute') ||
+    (m.name ?? '').toLowerCase().includes('shot'),
   );
 
   if (playerMarkets.length === 0) return null;
@@ -246,6 +312,7 @@ function extractMatchFromEvent(ev: any): ScrapedMatch | null {
     const mType: string = market.type ?? '';
     const mName: string = market.name ?? '';
     const marketKey = resolveMarketKey(mType, mName);
+    if (!marketKey) continue;
     const line = normalizeLine(mName);
 
     for (const outcome of (market.outcomes ?? [])) {
@@ -264,6 +331,7 @@ function extractMatchFromEvent(ev: any): ScrapedMatch | null {
         house: 'betmgm',
         market: marketKey,
         url: eventUrl,
+        competition: competitionKey,
       });
     }
   }
@@ -275,6 +343,7 @@ function extractMatchFromEvent(ev: any): ScrapedMatch | null {
     awayTeam,
     dateTime: new Date(ev.startTime ?? Date.now()),
     stage: extractStage(ev.leagueName ?? ev.group?.name ?? ''),
+    competition: competitionKey,
     odds,
   };
 }

@@ -1,12 +1,56 @@
 import { NextResponse } from 'next/server';
-import { isScrapeRunning, setScrapeRunning } from '@/lib/cron';
+import { isScrapeRunning, setScrapeRunning, tryAcquireScrapeLock, releaseScrapeLock } from '@/lib/cron';
 
-// Chave de proteção lida do ambiente. Se não definida, o endpoint fica
-// restrito apenas a chamadas internas (sem cabeçalho X-Scrape-Key configurado).
+// Chave de proteção lida do ambiente.
 const SCRAPE_SECRET = process.env.SCRAPE_SECRET ?? '';
+const IS_PROD = process.env.NODE_ENV === 'production';
+
+/**
+ * Pré-aquece o cache de todos os mercados para as abas carregarem instantaneamente.
+ * Chamado após a coleta completar.
+ */
+async function prewarmCache() {
+  const endpoints: Array<{ path: string; params: Record<string, string> }> = [
+    { path: '/api/desarmes', params: { market: 'desarmes' } },
+    { path: '/api/desarmes', params: { market: 'desarmes', allComps: 'true' } },
+    { path: '/api/desarmes', params: { market: 'faltas_cometidas' } },
+    { path: '/api/desarmes', params: { market: 'faltas_cometidas', allComps: 'true' } },
+    { path: '/api/desarmes', params: { market: 'faltas_sofridas' } },
+    { path: '/api/desarmes', params: { market: 'faltas_sofridas', allComps: 'true' } },
+    { path: '/api/desarmes', params: { market: 'finalizacao' } },
+    { path: '/api/desarmes', params: { market: 'finalizacao', allComps: 'true' } },
+    { path: '/api/desarmes', params: { market: 'chutes_ao_gol' } },
+    { path: '/api/desarmes', params: { market: 'chutes_ao_gol', allComps: 'true' } },
+    { path: '/api/value-odds', params: {} },
+  ];
+
+  // Sempre loopback — HOSTNAME no Windows/Linux costuma ser o nome da máquina.
+  const port = process.env.PORT || '3000';
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  const CONCURRENCY = 3;
+  for (let i = 0; i < endpoints.length; i += CONCURRENCY) {
+    const batch = endpoints.slice(i, i + CONCURRENCY);
+    await Promise.allSettled(
+      batch.map(async ({ path, params }) => {
+        try {
+          const searchParams = new URLSearchParams(params);
+          await fetch(`${baseUrl}${path}?${searchParams}`, {
+            cache: 'no-store',
+            signal: AbortSignal.timeout(60_000),
+          });
+        } catch {
+          // pré-aquecimento best-effort
+        }
+      }),
+    );
+  }
+}
 
 function isAuthorized(request: Request): boolean {
-  if (!SCRAPE_SECRET) return true; // sem secret configurado → permite (ambiente local)
+  // Em produção, secret é obrigatório
+  if (IS_PROD && !SCRAPE_SECRET) return false;
+  if (!SCRAPE_SECRET) return true; // dev local sem secret
   const key = request.headers.get('x-scrape-key') ?? '';
   return key === SCRAPE_SECRET;
 }
@@ -14,32 +58,44 @@ function isAuthorized(request: Request): boolean {
 export async function POST(request: Request) {
   if (!isAuthorized(request)) {
     return NextResponse.json(
-      { error: 'Não autorizado. Forneça o cabeçalho x-scrape-key correto.' },
-      { status: 401 }
+      {
+        error: IS_PROD && !SCRAPE_SECRET
+          ? 'SCRAPE_SECRET não configurado no servidor.'
+          : 'Não autorizado. Forneça o cabeçalho x-scrape-key correto.',
+      },
+      { status: 401 },
     );
   }
 
   if (isScrapeRunning()) {
     return NextResponse.json(
       { error: 'Scraping já em execução. Aguarde.' },
-      { status: 429 }
+      { status: 429 },
     );
   }
 
-  // Marca como em execução ANTES de disparar a IIFE para evitar
-  // janela de race condition entre o check e o start.
+  // Lock em DB + memória (multi-worker / restart mid-scrape)
+  const locked = await tryAcquireScrapeLock();
+  if (!locked) {
+    return NextResponse.json(
+      { error: 'Scraping já em execução (lock). Aguarde.' },
+      { status: 429 },
+    );
+  }
   setScrapeRunning(true);
 
-  // Executa assincronamente sem bloquear a resposta HTTP.
-  // O finally garante que isRunning volta para false mesmo em crash.
   (async () => {
     try {
       const { scrapeAll } = await import('@/scraping/index');
       await scrapeAll();
+      // Snapshots já são rebuildados no final do scrapeAll (apiSnapshot).
+      // Prewarm HTTP opcional — só se quiser aquecer edge/CDN; não bloqueia a UI.
+      prewarmCache().catch(() => null);
     } catch {
       // erro já logado dentro de scrapeAll
     } finally {
       setScrapeRunning(false);
+      await releaseScrapeLock();
     }
   })();
 
@@ -54,7 +110,6 @@ export async function GET() {
 
   const lastLog = await prisma.scrapeLog.findFirst({
     orderBy: { startedAt: 'desc' },
-    // Seleciona apenas campos públicos — omite errorMsg (pode conter stack trace interno)
     select: {
       id: true,
       startedAt: true,

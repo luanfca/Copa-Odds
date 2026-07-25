@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import Link from 'next/link';
 import { Trophy, Star, RefreshCw, BarChart2, ChevronUp, ChevronDown, Minus, Info } from 'lucide-react';
-import { formatDateTime, cn, formatOdd, HOUSE_LABELS, HOUSE_COLORS } from '@/lib/utils';
+import { formatDateTime, cn, formatOdd, HOUSE_LABELS, HOUSE_COLORS, ALL_HOUSES } from '@/lib/utils';
 import { Flag } from '@/components/Flag';
 import type { OddEntry } from '@/lib/arbitrage';
 import { OddHistoryModal } from '@/components/OddHistoryModal';
@@ -42,7 +42,7 @@ interface UnifiedRow {
   bestOdd?: OddEntry;
 }
 
-const HOUSES: Array<'betfair' | 'betmgm' | 'superbet' | 'pitaco'> = ['betfair', 'betmgm', 'superbet', 'pitaco'];
+const HOUSES = ALL_HOUSES;
 
 const LINE_STYLES: Record<string, { bg: string; text: string; border: string }> = {
   '1+': { bg: 'bg-emerald-500/10', text: 'text-emerald-400', border: 'border-emerald-500/20' },
@@ -52,7 +52,9 @@ const LINE_STYLES: Record<string, { bg: string; text: string; border: string }> 
 };
 
 export default function FavoritesPage() {
-  const [market, setMarket] = useState<'desarmes' | 'faltas_cometidas' | 'faltas_sofridas'>('desarmes');
+  const [market, setMarket] = useState<
+    'desarmes' | 'faltas_cometidas' | 'faltas_sofridas' | 'finalizacao' | 'chutes_ao_gol'
+  >('desarmes');
   const [favorites, setFavorites] = useState<string[]>([]);
   const [matches, setMatches] = useState<Match[]>([]);
   const [allPlayersData, setAllPlayersData] = useState<Record<string, Player[]>>({});
@@ -225,7 +227,15 @@ export default function FavoritesPage() {
             Jogadores Favoritos
           </h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Monitore em tempo real as odds de {market === 'desarmes' ? 'desarmes' : market === 'faltas_cometidas' ? 'faltas cometidas' : 'faltas sofridas'} dos seus jogadores marcados como favoritos.
+            Monitore em tempo real as odds de{' '}
+            {{
+              desarmes: 'desarmes',
+              faltas_cometidas: 'faltas cometidas',
+              faltas_sofridas: 'faltas sofridas',
+              finalizacao: 'finalizações',
+              chutes_ao_gol: 'chutes ao gol',
+            }[market]}{' '}
+            dos seus jogadores marcados como favoritos.
           </p>
         </div>
 
@@ -252,6 +262,8 @@ export default function FavoritesPage() {
             { id: 'desarmes', label: 'Desarmes', icon: '🛡️' },
             { id: 'faltas_cometidas', label: 'Faltas Cometidas', icon: '⚠️' },
             { id: 'faltas_sofridas', label: 'Faltas Sofridas', icon: '🤕' },
+            { id: 'finalizacao', label: 'Finalização', icon: '🎯' },
+            { id: 'chutes_ao_gol', label: 'Chute ao Gol', icon: '🥅' },
           ].map((item) => (
             <button
               key={item.id}
@@ -305,7 +317,15 @@ export default function FavoritesPage() {
           <div>
             <h3 className="text-foreground/80 font-bold text-lg">Nenhuma odd disponível para os favoritos</h3>
             <p className="text-muted-foreground text-sm max-w-md mt-1 mx-auto">
-              Os seus {favorites.length} jogadores favoritados não possuem odds ativas no mercado de {market === 'desarmes' ? 'desarmes' : market === 'faltas_cometidas' ? 'faltas cometidas' : 'faltas sofridas'} nas partidas atuais.
+              Os seus {favorites.length} jogadores favoritados não possuem odds ativas no mercado de{' '}
+              {{
+                desarmes: 'desarmes',
+                faltas_cometidas: 'faltas cometidas',
+                faltas_sofridas: 'faltas sofridas',
+                finalizacao: 'finalizações',
+                chutes_ao_gol: 'chutes ao gol',
+              }[market]}{' '}
+              nas partidas atuais.
             </p>
           </div>
         </div>

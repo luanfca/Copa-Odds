@@ -43,6 +43,8 @@ export function PlayerAvatar({ name, team, size = 32, className }: PlayerAvatarP
   if (!failed) {
     const params = new URLSearchParams({ name });
     if (team) params.set('team', team);
+    // v=2: bust cache de fotos erradas (matching de clube corrigido)
+    params.set('v', '2');
     const src = `/api/player-photo?${params.toString()}`;
     return (
       <img

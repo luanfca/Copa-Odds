@@ -1,6 +1,8 @@
-# Comparador de Odds Esportivas - Copa do Mundo 2026
+# Comparador de Odds ao Vivo — Brasileirão
 
-Aplicacao web que coleta, normaliza e compara, em tempo quase real, odds de mercados por jogador (desarmes, faltas cometidas e faltas sofridas) de casas de apostas brasileiras. Atualmente integra 6 casas, sendo 4 em funcionamento e 2 em desenvolvimento, com destaque automatico da melhor odd, deteccao de arbitragem e historico de variacao em grafico.
+Aplicação web que coleta, normaliza e compara, em tempo quase real, odds de
+mercados por jogador do Brasileirão. O sistema reúne seis casas, destaca a
+melhor odd, detecta desajustes e arbitragem e mantém o histórico de variação.
 
 > Projeto de estudo focado em **engenharia de dados**, **web scraping de fontes protegidas** e **integracao de multiplas APIs**. O objetivo foi tecnico: aprender a coletar, padronizar e cruzar dados de fontes heterogeneas e instaveis.
 
@@ -16,12 +18,16 @@ Cada casa de apostas publica os mesmos mercados de formas diferentes: nomes de j
 - Destaque automatico da melhor odd disponivel
 - Deteccao de oportunidades de arbitragem
 - Historico de variacao das odds em grafico
+- Rankings por mercado e estatísticas históricas de jogadores
+- Favoritos, filtros por jogo/time e acompanhamento do status da coleta
+- Cache persistente e snapshots das APIs para carregamento rápido
+- Interface responsiva instalável como PWA
 - Coleta automatica diaria (agendada para 08:00 BRT)
 - Modo mock com dados ficticios, para rodar sem depender das casas
 
 ## Mercados suportados
 
-Desarmes, faltas cometidas e faltas sofridas.
+Desarmes, faltas cometidas, faltas sofridas, finalizações e chutes ao gol.
 
 ## Fontes de dados
 
@@ -43,17 +49,19 @@ flowchart LR
     A["Casas de apostas (4 ativas + 2 em desenvolvimento)"] --> B["Coletores (REST / Playwright / gRPC)"]
     B --> C["Normalizacao de nomes (Levenshtein + slugify)"]
     C --> D["Banco SQLite (Prisma)"]
-    D --> E["API (Next.js Route Handlers)"]
-    E --> F["Interface web (tabela + graficos)"]
+    D --> E["Cache persistente + snapshots"]
+    E --> F["API (Next.js Route Handlers)"]
+    F --> G["Interface web (tabelas, rankings e gráficos)"]
 ```
 
 ## Tecnologias
 
 - **Frontend:** Next.js 14 (App Router), TypeScript, Tailwind CSS, Radix UI, Recharts
 - **Scraping:** Playwright (Chromium headless), com sessoes persistidas, User-Agent real e delays aleatorios
-- **Backend:** Next.js Route Handlers, node-cron (coleta diaria)
+- **Backend:** Next.js Route Handlers e agendador interno de coleta
 - **Banco de dados:** SQLite via Prisma ORM
 - **Bibliotecas de apoio:** fast-levenshtein (comparacao de nomes), protobufjs (decode gRPC), winston (logging)
+- **Tempo real e interface:** WebSocket, PWA, Radix UI e Recharts
 
 ## Como rodar
 
@@ -85,6 +93,7 @@ Comandos uteis:
 ```bash
 npm run scrape      # roda a coleta manualmente
 npm run db:studio   # abre o visualizador do banco de dados
+npm run check       # typecheck + testes unitários
 ```
 
 Modos de execucao por variavel de ambiente:
@@ -103,10 +112,32 @@ As casas sao SPAs com protecao anti-bot. Foi preciso analisar o trafego de rede 
 **3. Decodificacao de gRPC com protobuf (Pitaco).**
 O Pitaco trafega os dados em formato binario via gRPC. Foi necessario interceptar as respostas e decodificar o protobuf manualmente para extrair as odds.
 
-## Status e proximos passos
+## Estrutura principal
+
+```text
+src/app/          páginas e rotas de API
+src/components/   componentes da interface
+src/lib/          domínio, cache, banco, estatísticas e infraestrutura
+src/scraping/     orquestração e adapters das casas
+prisma/           modelo do banco de dados
+__tests__/        testes unitários automatizados
+scripts/          runtime, manutenção e diagnósticos
+```
+
+Veja também [`scripts/README.md`](scripts/README.md) para a classificação dos
+scripts auxiliares.
+
+## Deploy gratuito
+
+O projeto inclui containers ARM64, HTTPS automático, persistência e scripts
+para uma VM Oracle Cloud Always Free. Consulte o
+[`guia de deploy na Oracle`](docs/DEPLOY_ORACLE_FREE.md).
+
+## Status e próximos passos
 
 - Em funcionamento: Betfair, BetMGM, Superbet e Pitaco.
 - Em desenvolvimento: Betsson e Bet365 (coleta das odds ainda em ajuste).
+- Ampliar a cobertura automatizada dos adapters e dos fluxos de consolidação.
 
 ## Aprendizados
 

@@ -2,21 +2,13 @@
  * Adaptador de scraping para Superbet Brasil — via API REST direta.
  *
  * Estratégia (sem browser):
- * 1. Busca jogos da Copa do Mundo em múltiplos torneios via CDN da Superbet.
- *    ANTES: loop serial com delay(300) por torneio.
- *    AGORA: Promise.allSettled paralelizado — ~8x mais rápido.
+ * 1. Busca jogos de múltiplas competições via CDN da Superbet.
  * 2. Para cada jogo, busca mercados via BetBuilder API.
- * 3. Filtra mercados de desarmes, faltas cometidas e faltas sofridas.
+ * 3. Filtra mercados de desarmes, faltas, finalizações e chutes.
  *
  * APIs descobertas via análise de tráfego real:
  * - CDN:        https://production-superbet-offer-br.freetls.fastly.net/v2/pt-BR/events/by-date
  * - BetBuilder: https://production-superbet-bmb.freetls.fastly.net/betbuilder/v2/getBetbuilderMarketsForMatch
- *
- * MUDANÇAS vs versão anterior:
- * - REMOVIDO: `scrapeSuperbet_browserFallback` — dead code (função nunca usada)
- * - REMOVIDO: interfaces ScrapedOdd/ScrapedMatch locais → usa src/types/scraping.ts
- * - ALTERADO: busca de torneios de serial (for loop) para paralela (Promise.allSettled)
- * - ADICIONADO: tipagem estrita ao longo do módulo (sem `any` implícito)
  */
 
 import { logger } from '../lib/logger';
@@ -26,14 +18,22 @@ import type { ScrapedMatch, ScrapedOdd } from '../types/scraping';
 // ─── Configuração ─────────────────────────────────────────────────────────────
 
 /**
- * Copa do Mundo FIFA 2026 na Superbet = categoryId 102 (futebol = sportId 5).
- * Buscamos a competição INTEIRA por categoria numa única request, em vez de
- * listar IDs de torneio (grupo) na mão. Assim TODOS os grupos entram
- * automaticamente — inclusive os que ficam em IDs de torneio não-sequenciais
- * (ex.: Inglaterra/Croácia, Portugal, Argentina, França ficavam de fora
- * quando dependíamos da lista fixa 1432-1439).
+ * Tournament IDs na Superbet Brasil (API CDN).
+ * Descobertos via interceptação da página:
+ * - brasileirao (Série A) => tournamentId 1698
+ * - mls                    => categoryId 241 (MLS), filtrada por tournamentId 897 (1ª divisão)
+ * - copa                    => categoryId 102 (Copa do Mundo)
+ * A API `/events/by-date` aceita `tournamentIds` (Série A) ou `categoryId`
+ * (Copa, MLS). A MLS é uma categoria (241) cujo torneio de 1ª divisão é 897;
+ * os demais (58341, 3743, 37036, 40768) são MLS Next/USL/feminino e são ignorados.
  */
-const COPA_CATEGORY_ID = 102;
+const COMPETITION_TOURNAMENTS: Record<string, { tournamentId?: number; categoryId?: number; filterTournamentId?: number; name: string }> = {
+  copa: { categoryId: 102, name: 'Copa do Mundo' },
+  brasileirao: { tournamentId: 1698, name: 'Brasileirão Série A' },
+  mls: { categoryId: 241, filterTournamentId: 897, name: 'Major League Soccer' },
+  // Premier League e La Liga precisam de season ativa para ter dados
+};
+
 const SPORT_ID_FUTEBOL = 5;
 
 const CDN_BASE = 'https://production-superbet-offer-br.freetls.fastly.net';
@@ -59,6 +59,7 @@ interface TournamentMatch {
   awayTeam: string;
   dateTime: Date;
   tournamentId: number;
+  competition?: string;
 }
 
 // ─── API pública ──────────────────────────────────────────────────────────────
@@ -66,45 +67,44 @@ interface TournamentMatch {
 /**
  * Ponto de entrada do scraping Superbet.
  *
- * Fluxo:
- * 1. Busca todos os jogos da Copa em paralelo (8 torneios simultaneamente).
- * 2. Para cada jogo, busca mercados de jogador via BetBuilder (sequencial com delay
- *    para respeitar o rate limit da API de betbuilder).
+ * @param competitionKeys - Chaves das competições para buscar.
+ * Se vazio, busca todas as competições configuradas.
  */
-export async function scrapeSuperbet(): Promise<ScrapedMatch[]> {
-  logger.info('[Superbet] Iniciando scraping direto via API...');
+export async function scrapeSuperbet(competitionKeys?: string[]): Promise<ScrapedMatch[]> {
+  logger.info('[Superbet] Iniciando scraping via API CDN...');
   const results: ScrapedMatch[] = [];
 
   try {
-    // ── PASSO 1: Busca paralela de todos os torneios ──
-    const matchIds = await fetchCopaMatchIds();
-    logger.info(`[Superbet] ${matchIds.length} jogos da Copa encontrados.`);
+    // Determina quais competições buscar
+    const compsToScrape = competitionKeys?.length
+      ? competitionKeys.filter(k => COMPETITION_TOURNAMENTS[k])
+      : Object.keys(COMPETITION_TOURNAMENTS);
 
-    if (matchIds.length === 0) {
-      logger.warn('[Superbet] Nenhum jogo da Copa encontrado.');
-      return results;
-    }
+    for (const compKey of compsToScrape) {
+      const comp = COMPETITION_TOURNAMENTS[compKey];
+      const idLabel = comp.tournamentId ? `tournamentId: ${comp.tournamentId}` : `categoryId: ${comp.categoryId}`;
+      logger.info(`[Superbet] Buscando jogos da competição: ${compKey} (${idLabel})`);
 
-    // ── PASSO 2: Busca de mercados de jogador (sequential — rate limiting) ──
-    for (const match of matchIds) {
-      try {
-        await delay(MATCH_PLAYER_DELAY_MS);
-        const matchData = await fetchMatchPlayerMarkets(match);
-        if (matchData) {
-          results.push(matchData);
-          logger.info(
-            `[Superbet] ${match.homeTeam} vs ${match.awayTeam}: ${matchData.odds.length} odds coletadas.`,
-          );
-        } else {
-          logger.warn(
-            `[Superbet] ${match.homeTeam} vs ${match.awayTeam} [id ${match.id}]: SEM odds de desarmes/faltas (ver motivo no log acima).`,
-          );
+      const matchIds = await fetchMatchIdsForCategory(comp, compKey);
+      logger.info(`[Superbet] ${compKey}: ${matchIds.length} jogos encontrados.`);
+
+      if (matchIds.length === 0) {
+        logger.warn(`[Superbet] ${compKey}: Nenhum jogo encontrado.`);
+        continue;
+      }
+
+      for (const match of matchIds) {
+        try {
+          const matchData = await fetchMatchPlayerMarkets(match, compKey);
+          if (matchData) {
+            results.push(matchData);
+            logger.info(
+              `[Superbet] ${compKey}: ${match.homeTeam} vs ${match.awayTeam}: ${matchData.odds.length} odds.`,
+            );
+          }
+        } catch (err) {
+          logger.warn(`[Superbet] Erro ao processar jogo ${match.id}:`, { error: String(err) });
         }
-      } catch (err) {
-        logger.warn(
-          `[Superbet] Falha ao buscar odds de ${match.homeTeam} vs ${match.awayTeam}:`,
-          { error: String(err) },
-        );
       }
     }
 
@@ -119,26 +119,50 @@ export async function scrapeSuperbet(): Promise<ScrapedMatch[]> {
 // ─── Funções internas ─────────────────────────────────────────────────────────
 
 /**
- * Busca jogos da Copa do Mundo em todos os torneios configurados.
- *
- * Paraleliza as 8 requests de torneio com Promise.allSettled para que
- * a falha de um torneio não bloqueie os demais.
+ * Busca jogos de uma competição específica via API CDN.
+ * Usa `tournamentIds` quando a competição tem um (Série A, MLS) ou
+ * `categoryId` (Copa). A janela de datas é ampla (hoje-1 até hoje+10)
+ * para capturar toda a rodada, não apenas os jogos das próximas 24h.
  */
-async function fetchCopaMatchIds(): Promise<TournamentMatch[]> {
-  // Janela de busca: 1 dia atrás até o futuro (inclui jogos em andamento)
-  const startDate = new Date();
-  startDate.setDate(startDate.getDate() - 1);
-  const startStr = startDate.toISOString().replace('T', ' ').slice(0, 19);
+async function fetchMatchIdsForCategory(
+  comp: { tournamentId?: number; categoryId?: number; filterTournamentId?: number },
+  competitionKey: string,
+): Promise<TournamentMatch[]> {
+  const start = new Date();
+  start.setDate(start.getDate() - 1);
+  const end = new Date();
+  end.setDate(end.getDate() + 10);
+  const startStr = start.toISOString().replace('T', ' ').slice(0, 19);
+  const endStr = end.toISOString().replace('T', ' ').slice(0, 19);
 
-  // ── Busca a Copa INTEIRA por categoria (1 request, pega todos os grupos) ──
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let events: any[] = [];
   try {
-    events = await fetchCopaEvents(startStr);
+    const url = new URL(`${CDN_BASE}/v2/pt-BR/events/by-date`);
+    url.searchParams.set('currentStatus', 'active');
+    url.searchParams.set('offerState', 'prematch');
+    url.searchParams.set('sportId', String(SPORT_ID_FUTEBOL));
+    url.searchParams.set('startDate', startStr);
+    url.searchParams.set('endDate', endStr);
+    if (comp.tournamentId) {
+      url.searchParams.set('tournamentIds', String(comp.tournamentId));
+    } else if (comp.categoryId) {
+      url.searchParams.set('categoryId', String(comp.categoryId));
+    }
+
+    const res = await fetch(url.toString(), { headers: BASE_HEADERS });
+    const idLabel = comp.tournamentId ? `tournament ${comp.tournamentId}` : `categoria ${comp.categoryId}`;
+    if (!res.ok) {
+      logger.warn(`[Superbet] events by-date (${idLabel}) retornou status ${res.status}`);
+      return [];
+    }
+
+    const data = await res.json() as { data?: any; events?: any[] };
+    events = Array.isArray(data?.data)
+      ? data.data
+      : (data?.data?.events ?? data?.events ?? []);
   } catch (err) {
-    logger.warn('[Superbet] Falha ao buscar eventos da Copa por categoria:', {
-      error: String(err),
-    });
+    logger.warn(`[Superbet] Erro ao buscar competição ${competitionKey}:`, { error: String(err) });
     return [];
   }
 
@@ -155,15 +179,14 @@ async function fetchCopaMatchIds(): Promise<TournamentMatch[]> {
     seenIds.add(numId);
 
     const name: string = ev.matchName ?? ev.eventName ?? '';
-    const parts = name.split(/\s+vs\s+|\s+x\s+|\s+[-–·]\s*|·/i);
+    const parts = name.split(/\s*[·x]\s*/i);
     const homeTeam = parts[0]?.trim() ?? '';
     const awayTeam = parts[1]?.trim() ?? '';
 
-    // Descarta eventos sem time visitante reconhecível
-    if (!homeTeam || !awayTeam) {
-      logger.warn(`[Superbet] Ignorando evento sem separador reconhecível: "${name}" [id ${numId}]`);
-      continue;
-    }
+    if (!homeTeam || !awayTeam) continue;
+
+    const evTournamentId = Number(ev.tournamentId ?? 0);
+    if (comp.filterTournamentId && evTournamentId !== comp.filterTournamentId) continue;
 
     allMatches.push({
       id: numId,
@@ -171,51 +194,19 @@ async function fetchCopaMatchIds(): Promise<TournamentMatch[]> {
       awayTeam,
       dateTime: new Date(ev.matchDate ?? ev.startDate ?? ev.utcDate ?? Date.now()),
       tournamentId: Number(ev.tournamentId ?? 0),
+      competition: competitionKey,
     });
   }
 
-  logger.info(
-    `[Superbet] Jogos encontrados (${allMatches.length}): ` +
-      allMatches.map(m => `${m.homeTeam} vs ${m.awayTeam} [id ${m.id}/t${m.tournamentId}]`).join('  |  '),
-  );
+  logger.info(`[Superbet] ${competitionKey}: ${allMatches.length} jogos encontrados.`);
   return allMatches;
 }
 
 /**
- * Busca TODOS os eventos da Copa do Mundo (categoryId 102 + futebol sportId 5)
- * numa única request por categoria. Assim todos os grupos entram de uma vez,
- * sem depender de uma lista fixa de IDs de torneio.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function fetchCopaEvents(startStr: string): Promise<any[]> {
-  const url = new URL(`${CDN_BASE}/v2/pt-BR/events/by-date`);
-  url.searchParams.set('currentStatus', 'active');
-  url.searchParams.set('sportId', String(SPORT_ID_FUTEBOL));
-  url.searchParams.set('categoryId', String(COPA_CATEGORY_ID));
-  url.searchParams.set('startDate', startStr);
-
-  const res = await fetch(url.toString(), { headers: BASE_HEADERS });
-  if (!res.ok) {
-    logger.warn(
-      `[Superbet] events by-date (categoria ${COPA_CATEGORY_ID}) retornou status ${res.status}`,
-    );
-    return [];
-  }
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const data = await res.json() as { data?: any; events?: any[] };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const events: any[] = Array.isArray(data?.data)
-    ? data.data
-    : (data?.data?.events ?? data?.events ?? []);
-  return events;
-}
-
-/**
- * Busca mercados de jogador (desarmes e faltas) para um jogo via BetBuilder API.
+ * Busca mercados de jogador (desarmes, faltas, finalizações) para um jogo via BetBuilder API.
  * Retorna null se não houver mercados relevantes.
  */
-async function fetchMatchPlayerMarkets(match: TournamentMatch): Promise<ScrapedMatch | null> {
+async function fetchMatchPlayerMarkets(match: TournamentMatch, competitionKey: string): Promise<ScrapedMatch | null> {
   const url = new URL(`${BMB_BASE}/betbuilder/v2/getBetbuilderMarketsForMatch`);
   url.searchParams.set('match_id', String(match.id));
   url.searchParams.set('lang', 'pt-BR');
@@ -232,7 +223,7 @@ async function fetchMatchPlayerMarkets(match: TournamentMatch): Promise<ScrapedM
   const allMarkets = data?.markets ?? [];
   if (allMarkets.length === 0) {
     logger.warn(
-      `[Superbet] ${match.homeTeam} vs ${match.awayTeam} [id ${match.id}]: BetBuilder retornou 0 mercados (HTTP ${res.status}).`,
+      `[Superbet] ${match.homeTeam} vs ${match.awayTeam} [id ${match.id}]: BetBuilder retornou 0 mercados.`,
     );
     return null;
   }
@@ -250,7 +241,6 @@ async function fetchMatchPlayerMarkets(match: TournamentMatch): Promise<ScrapedM
       let playerName: string = spec.player_name ?? outcome.name ?? '';
       if (!playerName) continue;
 
-      // Remove sufixo " - Mais de X.5" se presente
       if (playerName.includes(' - ')) {
         playerName = playerName.split(' - ')[0].trim();
       }
@@ -261,8 +251,6 @@ async function fetchMatchPlayerMarkets(match: TournamentMatch): Promise<ScrapedM
 
       const line = resolveSuperbetLine(spec.total ?? null, outcome.name ?? '');
 
-      // A API BetBuilder da Superbet não informa o time do jogador.
-      // O time será preenchido no merge com dados do BetMGM/Betfair.
       odds.push({
         playerName,
         team: '',
@@ -271,30 +259,53 @@ async function fetchMatchPlayerMarkets(match: TournamentMatch): Promise<ScrapedM
         house: 'superbet',
         market: marketKey,
         url: eventUrl,
+        competition: competitionKey,
       });
     }
   }
 
   if (odds.length === 0) {
     logger.warn(
-      `[Superbet] ${match.homeTeam} vs ${match.awayTeam} [id ${match.id}]: ${allMarkets.length} mercados, 0 de desarmes/faltas. Nomes: ` +
-        allMarkets.map((m: any) => m?.name).filter(Boolean).slice(0, 25).join(' | '),
+      `[Superbet] ${match.homeTeam} vs ${match.awayTeam} [id ${match.id}]: ${allMarkets.length} mercados, 0 relevantes.`,
     );
-    return null;
+    // Retorna match "somente data" para que o merge preencha a dateTime real
+    // (a Superbet traz a data do jogo mesmo sem odds de jogador). Isso evita
+    // que outra fonte (ex: Pitaco) marque o jogo com a hora do scrape.
+    return {
+      homeTeam: match.homeTeam,
+      awayTeam: match.awayTeam,
+      dateTime: match.dateTime,
+      stage: COMPETITION_TOURNAMENTS[competitionKey]?.name ?? competitionKey,
+      competition: competitionKey,
+      odds: [],
+      dateOnly: true,
+    };
   }
 
   return {
     homeTeam: match.homeTeam,
     awayTeam: match.awayTeam,
     dateTime: match.dateTime,
-    stage: 'Copa do Mundo 2026',
+    stage: COMPETITION_TOURNAMENTS[competitionKey]?.name ?? competitionKey,
+    competition: competitionKey,
     odds,
   };
+}
+
+/** Nomes de sub-mercados que NÃO devem ser mapeados como finalizacao ou chutes_ao_gol. */
+const SUB_MARKET_KEYWORDS = ['pé esquerdo', 'pe esquerdo', 'pé direito', 'pe direito', 'cabeceio', 'fora da área', 'fora da area', 'cabeça', 'cabeca'];
+
+function isSubMarket(name: string): boolean {
+  const lower = name.toLowerCase();
+  return SUB_MARKET_KEYWORDS.some(kw => lower.includes(kw));
 }
 
 /** Resolve o marketKey a partir do nome do mercado Superbet. */
 function resolveSuperbetMarketKey(marketName: string): string | null {
   const lower = marketName.toLowerCase();
+
+  // Ignora sub-mercados (Pé Esquerdo, Pé Direito, Cabeceio, Fora da Área)
+  if (isSubMarket(marketName)) return null;
 
   if (
     lower.includes('total de desarmes') ||
@@ -310,6 +321,27 @@ function resolveSuperbetMarketKey(marketName: string): string | null {
     lower.includes('faltas sofridas') ||
     (lower.includes('jogador') && lower.includes('faltas sofridas'))
   ) return 'faltas_sofridas';
+
+  // Chutes no gol (shots on target) — mercado mais restritivo, odds mais altas
+  if (
+    lower.includes('chutes no gol') ||
+    lower.includes('chutes ao gol') ||
+    lower.includes('chute no gol') ||
+    lower.includes('chute ao gol')
+  ) return 'chutes_ao_gol';
+
+  // Finalizações = total de chutes — mercado mais amplo, odds mais baixas
+  // Apenas o mercado PRINCIPAL "Jogador - Finalizações" deve ser mapeado,
+  // NÃO os sub-mercados (Pé Esquerdo, Pé Direito, Cabeceio, Fora da Área)
+  if (
+    lower === 'jogador - finalizações' ||
+    lower === 'jogador - finalizacoes' ||
+    lower.includes('finalizações') ||
+    lower.includes('finalizacao')
+  ) return 'finalizacao';
+
+  // Fallback: mercado com 'chutes' sem ser sub-mercado e sem ser 'chutes no gol'
+  if (lower.includes('chutes') && !isSubMarket(marketName)) return 'finalizacao';
 
   return null;
 }

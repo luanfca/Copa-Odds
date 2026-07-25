@@ -1,58 +1,348 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { mockOddsData, mockMatches } from '@/lib/mockData';
+import { isSamePlayer } from '@/lib/normalize';
 import { computeProbableStarterIds } from '@/lib/starters';
 import { getStartersForMatch, type MatchStarters } from '@/lib/lineups365';
-import { getPlayerHistory } from '@/lib/playerStats365';
-import { SHARED_HISTORY_CACHE } from '@/lib/sharedCache';
+import { getPlayerHistory } from '@/lib/sofascoreStats';
+
+import { voCache, voRevalidating, setVoCache, setVoRevalidating, VO_TTL, VO_STALE_TTL } from '@/lib/cacheInvalidation';
+import { broadcastScrapeError } from '@/lib/ws-server';
 
 export const dynamic = 'force-dynamic';
-const VO_TTL = 60_000;       // 1 min: serve fresco
-const VO_STALE_TTL = 600_000; // 10 min: serve stale enquanto revalida
-let voCache: { body: any; t: number } | null = null;
-let voRevalidating = false; // evita revalidações paralelas
 
-/** Invalida cache server-side. Chamado após nova coleta. */
-export function invalidateVoCache(): void {
-  voCache = null;
-}
-// v5: evita cache de nulos devido a rate limit
-const CACHE_VERSION = 'v6-shared-cache-fix';
+type HistoryScope = 'league' | 'all';
 
-function hKey(team: string, name: string, market: string) {
-  return `${CACHE_VERSION}::${team}::${name}::${market}`;
+function normKeyPart(s: string): string {
+  return (s || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
 }
 
-// Executa o recálculo completo e atualiza voCache + HISTORY_CACHE3 em background
-async function revalidateCache() {
+/** Chave estável jogador+mercado (time normalizado separado na busca). */
+function playerMarketKey(name: string, market: string): string {
+  return `${normKeyPart(name)}::${market || 'desarmes'}`;
+}
+
+function teamNamesLooseMatch(a?: string | null, b?: string | null): boolean {
+  const na = normKeyPart(a || '');
+  const nb = normKeyPart(b || '');
+  if (!na || !nb) return false;
+  return na === nb || na.includes(nb) || nb.includes(na);
+}
+
+/**
+ * Ordem de times a tentar no SofaScore:
+ * 1) casa e visitante (sempre — corrige scrapers que marcam visitante como home)
+ * 2) team do scrap se for diferente (alias)
+ * Preferência: lado que devolver histórico; se ambos, o que bate com player.team.
+ */
+function candidateTeams(o: any): string[] {
+  const home = String(o.match?.homeTeam || '').trim();
+  const away = String(o.match?.awayTeam || '').trim();
+  const claimed = String(o.player?.team || '').trim();
+  const out: string[] = [];
+  const push = (t: string) => {
+    if (!t) return;
+    if (!out.some((x) => teamNamesLooseMatch(x, t))) out.push(t);
+  };
+  // Lado declarado primeiro se for casa ou visitante
+  if (claimed && (teamNamesLooseMatch(claimed, home) || teamNamesLooseMatch(claimed, away))) {
+    push(claimed);
+  }
+  push(home);
+  push(away);
+  if (claimed) push(claimed);
+  return out;
+}
+
+/**
+ * Anexa histórico SofaScore (SQLite permanente) em TODAS as oportunidades.
+ * Resolve o time real (casa/visitante) e corrige o.player.team quando o scrape errou.
+ */
+async function attachValueOddsHistory(
+  opportunities: any[],
+  opts: { maxGames: number; year?: number; historyScope: HistoryScope },
+): Promise<{ unique: number; filled: number }> {
+  if (!opportunities?.length) return { unique: 0, filled: 0 };
+  const maxGames = Math.min(Math.max(opts.maxGames || 5, 1), 10);
+  const preferAll = opts.historyScope === 'all';
+
+  type U = {
+    name: string;
+    teams: string[];
+    market: string;
+    competition?: string;
+    claimedTeam?: string;
+  };
+
+  // Únicos por NOME+MERCADO (várias linhas / times alias)
+  const unique = new Map<string, U>();
+  for (const o of opportunities) {
+    const name = o.player?.displayName || o.player?.name;
+    if (!name) continue;
+    const market = o.market || 'desarmes';
+    const key = playerMarketKey(name, market);
+    const teams = candidateTeams(o);
+    const existing = unique.get(key);
+    if (!existing) {
+      unique.set(key, {
+        name,
+        teams,
+        market,
+        competition: o.match?.competition,
+        claimedTeam: o.player?.team || '',
+      });
+    } else {
+      for (const t of teams) {
+        if (!existing.teams.some((x) => teamNamesLooseMatch(x, t))) existing.teams.push(t);
+      }
+      if (!existing.competition && o.match?.competition) {
+        existing.competition = o.match.competition;
+      }
+    }
+  }
+
+  type HistPack = {
+    entries: any[];
+    total: number;
+    average: number;
+    resolvedTeam: string;
+  };
+  const histByKey = new Map<string, HistPack>();
+  const list = Array.from(unique.entries());
+  // Cache quente no SQLite → concorrência alta; cold ainda ok com 10
+  const CONCURRENCY = 12;
+
+  for (let i = 0; i < list.length; i += CONCURRENCY) {
+    const batch = list.slice(i, i + CONCURRENCY);
+    await Promise.all(
+      batch.map(async ([key, u]) => {
+        try {
+          const scopes: HistoryScope[] = preferAll ? ['all'] : ['league', 'all'];
+          // Coleta hits por time; se 2 lados tiverem hist (raro), prefere claimed
+          const hits: HistPack[] = [];
+          for (const sc of scopes) {
+            if (hits.length) break;
+            for (const tryTeam of u.teams) {
+              const h = await getPlayerHistory(u.name, tryTeam, u.market, sc === 'all', {
+                maxGames,
+                year: opts.year,
+                competition:
+                  sc === 'league'
+                    ? u.competition && u.competition !== 'all'
+                      ? u.competition
+                      : 'brasileirao'
+                    : undefined,
+                historyScope: sc,
+              });
+              if (h?.entries?.length) {
+                hits.push({
+                  entries: h.entries,
+                  total: h.total,
+                  average: h.average,
+                  resolvedTeam: tryTeam,
+                });
+                // Claimed bateu → suficiente; senão tenta o outro lado também
+                if (u.claimedTeam && teamNamesLooseMatch(u.claimedTeam, tryTeam)) break;
+              }
+            }
+          }
+          if (!hits.length) return;
+          let best = hits[0];
+          if (hits.length > 1 && u.claimedTeam) {
+            const preferred = hits.find((h) => teamNamesLooseMatch(h.resolvedTeam, u.claimedTeam));
+            if (preferred) best = preferred;
+            else {
+              // Sem claimed válido: escolhe o com mais entradas / maior média
+              best = hits.reduce((a, b) =>
+                b.entries.length > a.entries.length ||
+                (b.entries.length === a.entries.length && b.average > a.average)
+                  ? b
+                  : a,
+              );
+            }
+          } else if (hits.length > 1) {
+            best = hits.reduce((a, b) =>
+              b.entries.length > a.entries.length ||
+              (b.entries.length === a.entries.length && b.average > a.average)
+                ? b
+                : a,
+            );
+          }
+          histByKey.set(key, best);
+        } catch {
+          /* best-effort */
+        }
+      }),
+    );
+  }
+
+  let filled = 0;
+  for (const o of opportunities) {
+    const name = o.player?.displayName || o.player?.name;
+    if (!name) {
+      o.history = o.history ?? null;
+      continue;
+    }
+    // Garante market string (UI de desajustes)
+    if (!o.market) o.market = 'desarmes';
+    const key = playerMarketKey(name, o.market);
+    const h = histByKey.get(key);
+    if (h) {
+      o.history = {
+        entries: h.entries,
+        total: h.total,
+        average: h.average,
+      };
+      // Corrige time errado do scrape (ex.: Badwal → Vancouver, não Cincinnati)
+      if (h.resolvedTeam) {
+        const home = o.match?.homeTeam;
+        const away = o.match?.awayTeam;
+        const claimed = o.player?.team;
+        const claimedOk =
+          claimed &&
+          (teamNamesLooseMatch(claimed, home) || teamNamesLooseMatch(claimed, away)) &&
+          teamNamesLooseMatch(claimed, h.resolvedTeam);
+        if (!claimedOk) {
+          o.player = { ...o.player, team: h.resolvedTeam };
+        } else if (!claimed) {
+          o.player = { ...o.player, team: h.resolvedTeam };
+        }
+      }
+      filled++;
+    } else {
+      o.history = o.history ?? null;
+      // Sem histórico: se team não é casa nem visitante, limpa (evita lixo na UI)
+      const claimed = o.player?.team;
+      const home = o.match?.homeTeam;
+      const away = o.match?.awayTeam;
+      if (
+        claimed &&
+        home &&
+        away &&
+        !teamNamesLooseMatch(claimed, home) &&
+        !teamNamesLooseMatch(claimed, away)
+      ) {
+        o.player = { ...o.player, team: '' };
+      }
+    }
+  }
+
+  return { unique: unique.size, filled };
+}
+
+// Executa o recálculo completo e atualiza voCache em background
+async function revalidateCache(opts?: {
+  maxGames?: number;
+  year?: number;
+  historyScope?: HistoryScope;
+}) {
   if (voRevalidating) return;
-  voRevalidating = true;
+  setVoRevalidating(true);
   try {
-    await buildResponse();
+    await buildResponse(opts);
   } finally {
-    voRevalidating = false;
+    setVoRevalidating(false);
   }
 }
 
 export async function GET(request: NextRequest) {
   const url = new URL(request.url);
   const forceRefresh = url.searchParams.has('refresh') || url.searchParams.has('bust');
+  const maxGamesRaw = url.searchParams.has('maxGames')
+    ? parseInt(url.searchParams.get('maxGames')!)
+    : 5;
+  const maxGames = Number.isFinite(maxGamesRaw)
+    ? Math.min(Math.max(maxGamesRaw || 5, 1), 10)
+    : 5;
+  const year = url.searchParams.has('year')
+    ? parseInt(url.searchParams.get('year')!)
+    : undefined;
+  const historyScope: HistoryScope =
+    url.searchParams.get('historyScope') === 'all' ? 'all' : 'league';
   const age = voCache ? Date.now() - voCache.t : Infinity;
 
-  // Serve cache fresco imediatamente
-  if (!forceRefresh && voCache && age < VO_TTL) {
-    return NextResponse.json(voCache.body);
+  // 1) Snapshot / light + histórico SofaScore (SQLite) — não devolver sem history
+  if (!forceRefresh) {
+    try {
+      const {
+        getApiSnapshotWithAge,
+        setApiSnapshot,
+        buildLightValueOdds,
+        SNAPSHOT_MAX_AGE_MS,
+      } = await import('@/lib/apiSnapshot');
+
+      let base: any = null;
+      let cacheTag = 'SNAPSHOT';
+      const snapMeta = await getApiSnapshotWithAge('value-odds');
+      if (snapMeta && snapMeta.ageMs < SNAPSHOT_MAX_AGE_MS) {
+        base = snapMeta.data;
+      } else if (voCache && age < 45_000) {
+        base = voCache.body;
+        cacheTag = 'MEMORY';
+      } else {
+        base = await buildLightValueOdds();
+        await setApiSnapshot('value-odds', 'value-odds', base);
+        cacheTag = 'BUILT-LIGHT';
+      }
+
+      if (base?.opportunities) {
+        // Copia rasa para não mutar snapshot em disco sem querer
+        const body = {
+          ...base,
+          opportunities: (base.opportunities as any[]).map((o) => ({ ...o })),
+        };
+        await attachValueOddsHistory(body.opportunities, {
+          maxGames,
+          year,
+          historyScope,
+        });
+        setVoCache(body, Date.now());
+        return NextResponse.json(body, {
+          headers: {
+            'X-Cache': `${cacheTag}+HIST`,
+            'Cache-Control': 'public, s-maxage=15, stale-while-revalidate=60',
+          },
+        });
+      }
+    } catch {
+      // cai no path completo
+    }
   }
-  // Cache expirou mas ainda está dentro do stale window: serve stale + revalida em bg
+
+  // Memória: re-anexa hist com os params pedidos (maxGames/scope) — não reusa cego
+  const memBody = voCache?.body as { opportunities?: any[] } | undefined;
+  if (!forceRefresh && voCache && age < VO_TTL && Array.isArray(memBody?.opportunities)) {
+    const body = {
+      ...memBody,
+      opportunities: memBody.opportunities.map((o) => ({ ...o })),
+    };
+    await attachValueOddsHistory(body.opportunities, { maxGames, year, historyScope });
+    return NextResponse.json(body, { headers: { 'X-Cache': 'MEMORY+HIST' } });
+  }
   if (!forceRefresh && voCache && age < VO_STALE_TTL) {
-    revalidateCache(); // fire-and-forget
+    revalidateCache({ maxGames, year, historyScope });
+    if (Array.isArray(memBody?.opportunities)) {
+      const body = {
+        ...memBody,
+        opportunities: memBody.opportunities.map((o) => ({ ...o })),
+      };
+      await attachValueOddsHistory(body.opportunities, { maxGames, year, historyScope });
+      return NextResponse.json(body, { headers: { 'X-Cache': 'STALE+HIST' } });
+    }
     return NextResponse.json(voCache.body);
   }
-  // Cache inválido ou forceRefresh: recalcula na hora e aguarda
-  return buildResponse();
+  return buildResponse({ maxGames, year, historyScope });
 }
 
-async function buildResponse(): Promise<NextResponse> {
+async function buildResponse(opts?: {
+  maxGames?: number;
+  year?: number;
+  historyScope?: HistoryScope;
+}): Promise<NextResponse> {
   try {
     const useMock = process.env.USE_MOCK === 'true';
 
@@ -135,17 +425,11 @@ async function buildResponse(): Promise<NextResponse> {
     }
 
     // BUSCA NO BANCO REAL
-    // 1. Localiza o último scrape com status de sucesso/parcial
-    const lastScrape = await prisma.scrapeLog.findFirst({
-      where: { status: { in: ['success', 'partial'] } },
-      orderBy: { finishedAt: 'desc' },
-    });
-
-    // Filtra odds coletadas apenas na última execução ativa (ou últimas 4h caso nulo)
-    // Reduz drasticamente a quantidade de snapshots carregados em memória.
-    const timeThreshold = lastScrape?.startedAt
-      ? lastScrape.startedAt
-      : new Date(Date.now() - 4 * 60 * 60 * 1000);
+    // Janela fixa de 48h: mostra odds de todos os scrapes recentes,
+    // independente de qual scrape as coletou.
+    // ANTES usava o startedAt do último scrape, o que fazia odds de
+    // scrapes anteriores sumirem quando um novo scrape rodava.
+    const timeThreshold = new Date(Date.now() - 48 * 60 * 60 * 1000);
 
     // 2. Busca todos os jogadores e seus snapshots nesse intervalo de tempo
     const players = await prisma.player.findMany({
@@ -205,6 +489,9 @@ async function buildResponse(): Promise<NextResponse> {
       betmgm:   'https://www.betmgm.bet.br',
       superbet: 'https://superbet.bet.br',
       betfair:  'https://www.betfair.bet.br',
+      bet365:   'https://www.bet365.bet.br',
+      betsson:  'https://www.betsson.bet.br',
+      pitaco:   'https://pitaco.bet.br',
     };
 
     // 3. Processa cada jogador e calcula as diferenças
@@ -212,7 +499,7 @@ async function buildResponse(): Promise<NextResponse> {
       if (player.snapshots.length === 0) continue;
 
       // Agrupa snapshots por mercado + linha
-      const groupKeyOdds = new Map<string, typeof player.snapshots>();
+      const groupKeyOdds = new Map<string, typeof player.snapshots[number][]>();
       for (const snap of player.snapshots) {
         const key = `${snap.market}:${snap.line}`;
         const list = groupKeyOdds.get(key) ?? [];
@@ -264,6 +551,7 @@ async function buildResponse(): Promise<NextResponse> {
                 awayFlag: player.match.awayFlag,
                 dateTime: player.match.dateTime.toISOString(),
                 stage: player.match.stage,
+                competition: player.match.competition,
               },
               market,
               line,
@@ -278,46 +566,86 @@ async function buildResponse(): Promise<NextResponse> {
       }
     }
 
+    // DEDUP: mescla só o MESMO jogador (fuzzy) no mesmo match+mercado+linha.
+    // A chave inclui identidade do jogador — antes era só match|line|market e
+    // sobrescrevia jogadores diferentes (ficava 1 por jogo/linha/mercado).
+    const dedupList: typeof opportunities = [];
+    for (const o of opportunities) {
+      let found = false;
+      for (const existing of dedupList) {
+        const sameMatch = existing.match.id === o.match.id;
+        const sameLine = existing.line === o.line;
+        const sameMarket = existing.market === o.market;
+        const sameTeam =
+          !existing.player.team || !o.player.team || existing.player.team === o.player.team;
+        if (
+          sameMatch &&
+          sameLine &&
+          sameMarket &&
+          sameTeam &&
+          isSamePlayer(existing.player.displayName, o.player.displayName)
+        ) {
+          for (const odd of o.odds) {
+            const existingOdd = existing.odds.find(
+              (eo) => eo.house === odd.house && eo.line === odd.line,
+            );
+            if (!existingOdd) {
+              existing.odds.push(odd);
+            } else if (odd.value > existingOdd.value) {
+              existingOdd.value = odd.value;
+              if (odd.url) existingOdd.url = odd.url;
+            }
+          }
+          const sorted = [...existing.odds].sort((a, b) => b.value - a.value);
+          existing.bestOddValue = sorted[0].value;
+          existing.bestOddHouse = sorted[0].house;
+          existing.secondBestOddValue = sorted[1]?.value ?? sorted[0].value;
+          existing.diffPct = parseFloat(
+            (
+              ((sorted[0].value - (sorted[1]?.value ?? sorted[0].value)) /
+                (sorted[1]?.value ?? sorted[0].value)) *
+              100
+            ).toFixed(1),
+          );
+          if (o.player.displayName.length > existing.player.displayName.length) {
+            existing.player.displayName = o.player.displayName;
+          }
+          found = true;
+          break;
+        }
+      }
+      if (!found) dedupList.push(o);
+    }
+    const dedupedOpportunities = dedupList;
+
     // Ordena decrescentemente por margem de desajuste logo de cara
-    opportunities.sort((a, b) => b.diffPct - a.diffPct);
+    dedupedOpportunities.sort((a, b) => b.diffPct - a.diffPct);
+
+    // Usa array deduplicado
+    opportunities.length = 0;
+    opportunities.push(...dedupedOpportunities);
 
     // CORTA O PAYLOAD: Envia os top 3000 maiores desajustes.
     // Garante que praticamente todo mundo que tem mercado aberto seja enviado.
     const topOpportunities = opportunities.slice(0, 3000);
 
-    // Histórico por mercado de cada jogador na Copa (jogos finalizados, via
-    // 365scores). Calculado por (jogador+mercado) distinto e cacheado.
-    // Busca history apenas para os TOP 500 para não estourar a API do 365scores.
-    await Promise.race([
-      Promise.all(
-        Array.from(
-          new Map(
-            topOpportunities.map((o) => [
-              `${o.player.team}::${o.player.displayName}::${o.market}`,
-              o,
-            ]),
-          ).values(),
-        ).map(async (o) => {
-          const key = hKey(o.player.team, o.player.displayName, o.market);
-          if (SHARED_HISTORY_CACHE.has(key)) return;
-          const h = await getPlayerHistory(o.player.displayName, o.player.team, o.market);
-          if (h !== null) {
-            SHARED_HISTORY_CACHE.set(key, h);
-          }
-        })
-      ),
-      new Promise<void>((resolve) => setTimeout(resolve, 120000))
-    ]);
-    for (const o of topOpportunities as any[]) {
-      const key = hKey(o.player.team, o.player.displayName, o.market);
-      const h = SHARED_HISTORY_CACHE.get(key);
-      o.history = h ? { entries: h.entries, total: h.total, average: h.average } : null;
-    }
+    // Histórico SofaScore (SQLite permanente) — fatia maxGames na resposta
+    await attachValueOddsHistory(topOpportunities as any[], {
+      maxGames: opts?.maxGames ?? 5,
+      year: opts?.year,
+      historyScope: opts?.historyScope ?? 'league',
+    });
 
     const body = { opportunities: topOpportunities, mock: false };
-    voCache = { body, t: Date.now() };
-    return NextResponse.json(body);
+    setVoCache(body, Date.now());
+
+    return NextResponse.json(body, {
+      headers: {
+        'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=300',
+      },
+    });
   } catch (error) {
+    broadcastScrapeError(String(error))
     return NextResponse.json(
       { error: 'Erro ao buscar odds desajustadas', detail: String(error) },
       { status: 500 }

@@ -47,8 +47,6 @@ export interface PlayerImage {
 // Helpers de texto
 // ---------------------------------------------------------------------------
 
-
-
 // Detecta linhas que NÃO são nomes de jogador (ex.: "Menos de 27.5",
 // "Mais de 2", "Over 1.5", números soltos). Evita buscar foto pra elas.
 export function isNonPlayerRow(name: string): boolean {
@@ -97,35 +95,37 @@ function searchPath(query: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Resolução de país (para desambiguar por seleção)
-// ---------------------------------------------------------------------------
-
-const countryIdCache = new Map<string, number>();
-
-export async function resolveCountryId(teamName: string): Promise<number | null> {
-  const key = normName(teamName);
-  if (!key) return null;
-  if (countryIdCache.has(key)) return countryIdCache.get(key) ?? null;
-
-  const data = await webwsJson(searchPath(teamName));
-  const countries: any[] = (data && data.countries) || [];
-  let best = countries.find((c) => normName(c.name) === key);
-  if (!best) best = countries.find((c) => Array.isArray(c.sportTypes) && c.sportTypes.includes(1));
-  if (!best && countries.length) best = countries[0];
-
-  const id = best && typeof best.id === 'number' ? best.id : null;
-  // Só cacheia sucesso: evita gravar falha transitória pra sempre.
-  if (id != null) countryIdCache.set(key, id);
-  return id;
-}
-
-// ---------------------------------------------------------------------------
 // Busca de atleta
 // ---------------------------------------------------------------------------
 
 const athleteCache = new Map<string, Athlete>();
 
-function scoreAthlete(a: Athlete, qTokens: string[], wantCountryId: number | null): number {
+function clubTokens(clubName?: string): string[] {
+  return tokens(clubName || '').filter((t) => t.length >= 3 && !['fc', 'sc', 'cf', 'ac', 'ec', 'cr', 'se'].includes(t));
+}
+
+/** Overlap de tokens entre time pedido e clube do atleta (ex.: "Corinthians" ⊆ "SC Corinthians Paulista"). */
+function clubTeamOverlap(teamNorm: string, clubName?: string): number {
+  if (!teamNorm || !clubName) return 0;
+  const clubNorm = normName(clubName);
+  if (!clubNorm) return 0;
+  if (clubNorm === teamNorm) return 3;
+  if (clubNorm.includes(teamNorm) || teamNorm.includes(clubNorm)) return 2;
+  const tTok = tokens(teamNorm).filter((t) => t.length >= 3);
+  const cTok = clubTokens(clubName);
+  if (!tTok.length || !cTok.length) return 0;
+  const cSet = new Set(cTok);
+  let hit = 0;
+  for (const t of tTok) if (cSet.has(t)) hit++;
+  return hit > 0 ? 1 : 0;
+}
+
+function scoreAthlete(
+  a: Athlete,
+  qTokens: string[],
+  wantCountryId: number | null,
+  teamNorm?: string,
+): number {
   const aTokens = tokens(a.name);
   const aSet = new Set(aTokens);
   let overlap = 0;
@@ -145,9 +145,18 @@ function scoreAthlete(a: Athlete, qTokens: string[], wantCountryId: number | nul
   }
   // mesma seleção
   if (wantCountryId != null && a.nationalityId === wantCountryId) score += 60;
-  // popularidade como desempate (craques de seleção têm rank alto)
+
+  // Time/clube: desempate forte — evita foto de homônimo de outro clube
+  if (teamNorm) {
+    const clubHit = clubTeamOverlap(teamNorm, a.clubName);
+    if (clubHit >= 2) score += 100;
+    else if (clubHit === 1) score += 70;
+    else if (a.clubName) score -= 55; // clube conhecido e diferente → penaliza
+  }
+
+  // popularidade só como desempate fraco (NÃO vencer match de clube)
   const pop = typeof a.popularityRank === 'number' ? a.popularityRank : 0;
-  score += Math.min(pop, 20000) / 1000; // até +20
+  score += Math.min(pop, 5000) / 2000; // até +2.5
   // só futebol
   if (a.sportId && a.sportId !== 1) score -= 100;
   return score;
@@ -161,19 +170,27 @@ async function searchOnce(query: string): Promise<Athlete[]> {
 
 export async function searchAthlete(name: string, team?: string): Promise<Athlete | null> {
   if (isNonPlayerRow(name)) return null;
-  const cacheKey = normName(name) + '|' + normName(team || '');
+  // v2: cache inclui team com scoring de clube (evita servir foto errada antiga)
+  const cacheKey = 'v2|' + normName(name) + '|' + normName(team || '');
   if (athleteCache.has(cacheKey)) return athleteCache.get(cacheKey) ?? null;
 
-  const wantCountryId = team ? await resolveCountryId(team) : null;
+  const wantCountryId = null; // Não usamos mais resolveCountryId
+
   const qTokens = tokens(name);
+  const teamNorm = team ? normName(team) : '';
 
   // Consultas progressivamente mais simples (nome completo, primeiro+último,
-  // só sobrenome e só primeiro nome).
+  // só sobrenome). NÃO busca só pelo primeiro nome curto (gera homônimos).
   const queries: string[] = [name];
+  if (teamNorm) {
+    // "Nome + Time" melhora o ranking da API 365scores
+    queries.push(`${name} ${team}`);
+  }
   if (qTokens.length >= 2) {
     queries.push(qTokens[0] + ' ' + qTokens[qTokens.length - 1]);
     queries.push(qTokens[qTokens.length - 1]);
-    queries.push(qTokens[0]);
+    // só primeiro nome se for razoavelmente específico
+    if (qTokens[0].length >= 5) queries.push(qTokens[0]);
   }
 
   let best: Athlete | null = null;
@@ -187,16 +204,23 @@ export async function searchAthlete(name: string, team?: string): Promise<Athlet
 
     const athletes = await searchOnce(q);
     for (const a of athletes) {
-      const sc = scoreAthlete(a, qTokens, wantCountryId);
+      const sc = scoreAthlete(a, qTokens, wantCountryId, teamNorm || undefined);
       if (sc > bestScore) {
         bestScore = sc;
         best = a;
       }
     }
-    if (best && bestScore >= 100) break; // candidato forte já encontrado
+    // Candidato forte com nome exato OU com match de clube
+    if (best && bestScore >= 140) break;
+    if (best && teamNorm && bestScore >= 100 && clubTeamOverlap(teamNorm, best.clubName) >= 1) break;
   }
 
-  if (best && bestScore < 40) best = null; // exige relevância mínima
+  // Exige relevância mínima; com time informado, rejeita homônimo sem clube
+  if (best && bestScore < 40) best = null;
+  if (best && teamNorm && clubTeamOverlap(teamNorm, best.clubName) === 0) {
+    // Nome mono-token (apelido) sem clube → alto risco de foto errada
+    if (qTokens.length <= 1 || bestScore < 90) best = null;
+  }
 
   // Só cacheia sucesso: se a busca falhou agora, deixa tentar de novo depois
   // (antes, um vazio transitório ficava cacheado e a foto sumia pra sempre).
@@ -235,15 +259,4 @@ export async function getAthleteImage(
     }
   }
   return null;
-}
-
-// Conveniência: resolve o atleta e baixa a foto em uma chamada.
-export async function getPhotoByName(
-  name: string,
-  team?: string,
-  size = 80,
-): Promise<PlayerImage | null> {
-  const a = await searchAthlete(name, team);
-  if (!a) return null;
-  return getAthleteImage(a.id, a.imageVersion, size);
 }

@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Trophy, Star, RefreshCw, CheckCircle2, AlertTriangle, XCircle, Clock, Zap, Shield, Heart } from 'lucide-react';
+import { Trophy, Star, RefreshCw, CheckCircle2, AlertTriangle, XCircle, Clock, Zap, Shield, Target } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useState, useEffect } from 'react';
 import { useToast } from '@/components/ui/use-toast';
@@ -105,8 +105,8 @@ export function Navbar() {
   const navLinks = [
     { href: '/',                    label: 'Jogos',           icon: Trophy   },
     { href: '/desarmes',            label: 'Desarmes',        icon: Shield   },
-    { href: '/faltas-cometidas',    label: 'Faltas Cometidas', icon: AlertTriangle },
-    { href: '/faltas-sofridas',     label: 'Faltas Sofridas',  icon: Heart    },
+    { href: '/faltas',              label: 'Faltas',          icon: AlertTriangle },
+    { href: '/finalizacao',         label: 'Finalização',     icon: Target   },
     { href: '/value-odds',          label: 'Desajustes',      icon: Zap      },
     { href: '/favorites',           label: 'Favoritos',       icon: Star     },
   ];
@@ -179,12 +179,12 @@ export function Navbar() {
             </div>
             <div className="leading-none">
               <div className="text-base font-black tracking-tight flex items-center gap-0.5">
-                <span className="text-foreground">Copa</span>
+                <span className="text-foreground">BR</span>
                 <span className="text-primary">Odds</span>
               </div>
               <p className="text-[9px] text-muted-foreground/60 font-bold
                             tracking-[0.16em] uppercase leading-none mt-1">
-                Desarmes · Faltas
+                Brasileirão · Odds ao Vivo
               </p>
             </div>
           </Link>

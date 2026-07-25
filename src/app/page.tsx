@@ -17,6 +17,7 @@ interface Match {
   homeFlag: string | null;
   awayFlag: string | null;
   dateTime: string;
+  competition: string;
   stage: string;
   playerCount: number;
 }
@@ -33,25 +34,19 @@ interface ApiResponse {
 /** Janela de "jogo encerrado": início + 3h30 (cobre prorrogação + pênaltis). */
 const FINISHED_AFTER_MS = 3.5 * 60 * 60 * 1000;
 
-/** Fases eliminatórias — recebem tratamento visual dourado. */
-const KNOCKOUT_STAGES = new Set([
-  'Final',
-  'Disputa de 3º Lugar',
-  'Semifinal',
-  'Quartas de Final',
-  'Oitavas de Final',
-]);
+/** Rótulos amigáveis das competições exibidas na home. */
+const COMPETITION_LABELS: Record<string, string> = {
+  brasileirao: 'Brasileirão Série A',
+  mls: 'Major League Soccer',
+  copa: 'Copa do Mundo 2026',
+};
 
-/** Ordem de exibição das fases (mais importante primeiro). */
-const STAGE_ORDER = [
-  'Final',
-  'Disputa de 3º Lugar',
-  'Semifinal',
-  'Quartas de Final',
-  'Oitavas de Final',
-  'Fase de Grupos',
-  'Copa do Mundo 2026',
-];
+/** Ordem de exibição das competições (mais importante primeiro). */
+const COMPETITION_ORDER = ['brasileirao', 'mls', 'copa'];
+
+function competitionLabel(key: string): string {
+  return COMPETITION_LABELS[key] ?? key;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -67,7 +62,10 @@ function isMatchToday(m: Match): boolean {
 function isMatchLive(m: Match): boolean {
   const t = new Date(m.dateTime).getTime();
   const now = Date.now();
-  return !Number.isNaN(t) && t <= now && now < t + FINISHED_AFTER_MS;
+  // Janela de jogo ao vivo ~120 min (90 + acréscimos/intervalo).
+  // Ainda respeita FINISHED_AFTER_MS como teto absoluto.
+  const LIVE_WINDOW_MS = 120 * 60 * 1000;
+  return !Number.isNaN(t) && t <= now && now - t < LIVE_WINDOW_MS && now < t + FINISHED_AFTER_MS;
 }
 
 /** Formata "há Xmin" / "há Xh" / "há Xd" */
@@ -89,7 +87,7 @@ export default function HomePage() {
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState<string | null>(null);
   const [showPast, setShowPast] = useState(false);
-  const [stageFilter, setStageFilter] = useState<string>('Todos');
+  const [competitionFilter, setCompetitionFilter] = useState<string>('Todos');
 
   // ── Fetch ──────────────────────────────────────────────────────────────────
 
@@ -111,7 +109,17 @@ export default function HomePage() {
 
   // ── Derivações ─────────────────────────────────────────────────────────────
 
-  const allMatches  = data?.matches ?? [];
+  const allMatches  = useMemo(() => {
+    const list = data?.matches ?? [];
+    return list.filter(m => {
+      // Remove lixo do scrape: time repetido, sem nome ou data inválida.
+      if (!m.homeTeam || !m.awayTeam) return false;
+      if (m.homeTeam.trim() === m.awayTeam.trim()) return false;
+      const t = new Date(m.dateTime).getTime();
+      if (Number.isNaN(t)) return false;
+      return true;
+    });
+  }, [data]);
   const pastMatches = useMemo(() => allMatches.filter(isMatchFinished), [allMatches]);
   const liveCount   = useMemo(() => allMatches.filter(isMatchLive).length, [allMatches]);
   const todayCount  = useMemo(() => allMatches.filter(isMatchToday).length, [allMatches]);
@@ -122,17 +130,17 @@ export default function HomePage() {
     [allMatches, showPast],
   );
 
-  /** Fases únicas presentes nos dados (ordenadas). */
-  const availableStages = useMemo(() => {
-    const stages = Array.from(new Set(baseMatches.map(m => m.stage)));
-    return stages.sort((a, b) => STAGE_ORDER.indexOf(a) - STAGE_ORDER.indexOf(b));
+  /** Competições únicas presentes nos dados (ordenadas). */
+  const availableCompetitions = useMemo(() => {
+    const keys = Array.from(new Set(baseMatches.map(m => m.competition)));
+    return keys.sort((a, b) => COMPETITION_ORDER.indexOf(a) - COMPETITION_ORDER.indexOf(b));
   }, [baseMatches]);
 
-  /** Jogos após filtro de fase. */
+  /** Jogos após filtro de competição. */
   const visibleMatches = useMemo(() => {
-    if (stageFilter === 'Todos') return baseMatches;
-    return baseMatches.filter(m => m.stage === stageFilter);
-  }, [baseMatches, stageFilter]);
+    if (competitionFilter === 'Todos') return baseMatches;
+    return baseMatches.filter(m => m.competition === competitionFilter);
+  }, [baseMatches, competitionFilter]);
 
   /**
    * Identifica os 2 primeiros jogos de hoje (mais próximos do horário atual)
@@ -152,19 +160,19 @@ export default function HomePage() {
     return new Set(todayMatches);
   }, [visibleMatches]);
 
-  // Reseta o filtro de fase quando os dados mudam e a fase selecionada deixa de existir
+  // Reseta o filtro de competição quando os dados mudam e a competição selecionada deixa de existir
   useEffect(() => {
-    if (stageFilter !== 'Todos' && !availableStages.includes(stageFilter)) {
-      setStageFilter('Todos');
+    if (competitionFilter !== 'Todos' && !availableCompetitions.includes(competitionFilter)) {
+      setCompetitionFilter('Todos');
     }
-  }, [availableStages, stageFilter]);
+  }, [availableCompetitions, competitionFilter]);
 
-  // ── KPI: status ative houses ───────────────────────────────────────────────
+  // ── KPI: status das casas de apostas ──────────────────────────────────────
   const statusLabel = useMemo(() => {
     if (!data) return null;
-    if (data.scrapeStatus === 'success') return { text: '4 casas ativas', color: 'text-emerald-400' };
+    if (data.scrapeStatus === 'success') return { text: 'Casas ativas', color: 'text-emerald-400' };
     if (data.scrapeStatus === 'partial') return { text: 'Coleta parcial', color: 'text-amber-400' };
-    if (data.scrapeStatus === 'failed')  return { text: '0 casas ativas', color: 'text-rose-400' };
+    if (data.scrapeStatus === 'failed')  return { text: 'Sem coleta', color: 'text-rose-400' };
     return null;
   }, [data]);
 
@@ -178,14 +186,14 @@ export default function HomePage() {
         <div className="space-y-2">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-primary/8 border border-primary/15 text-[10px] font-black uppercase tracking-widest text-primary shadow-sm">
             <Sparkles className="w-3 h-3 animate-spin" style={{ animationDuration: '4s' }} />
-            Monitoramento Copa 2026
+            Monitoramento Brasileirão + MLS
           </div>
           <h1 className="text-3xl sm:text-4xl font-black tracking-tight flex items-center gap-2">
-            <span>COPA</span>
             <span className="hero-gradient-text">ODDS</span>
+            <span>AO VIVO</span>
           </h1>
           <p className="text-xs sm:text-sm text-muted-foreground font-medium max-w-lg">
-            Compare odds de desarmes, faltas cometidas e faltas sofridas em tempo real de Betfair, BetMGM e Superbet.
+            Compare odds de desarmes, faltas, finalizações e chutes ao gol por jogador em tempo real de Betfair, BetMGM, Superbet e Pitaco.
           </p>
         </div>
 
@@ -217,17 +225,17 @@ export default function HomePage() {
               )}
             </div>
 
-            {/* Casas ativas */}
+            {/* Status das casas de apostas */}
             {statusLabel && (
               <div className="kpi-pill kpi-status flex-1 sm:flex-none min-w-[130px]">
                 <div className="kpi-icon">
-                  <Activity className="w-4 h-4 text-primary" />
+                  <Activity className={cn('w-4 h-4', statusLabel.color)} />
                 </div>
                 <div className="flex flex-col">
-                  <span className={cn('kpi-value', statusLabel.color)}>
-                    {statusLabel.text.split(' ')[0]}
+                  <span className={cn('kpi-value text-sm', statusLabel.color)}>
+                    {statusLabel.text}
                   </span>
-                  <span className="kpi-label">casas ativas</span>
+                  <span className="kpi-label">status das casas</span>
                 </div>
               </div>
             )}
@@ -262,31 +270,29 @@ export default function HomePage() {
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pt-1 slide-up" style={{ animationFillMode: 'forwards', animationDelay: '0.05s' }}>
           
           {/* Abas */}
-          {availableStages.length > 1 && (
+          {availableCompetitions.length > 1 && (
             <div className="stage-tabs">
               <button
-                onClick={() => setStageFilter('Todos')}
-                className={cn('stage-tab', stageFilter === 'Todos' && 'active')}
+                onClick={() => setCompetitionFilter('Todos')}
+                className={cn('stage-tab', competitionFilter === 'Todos' && 'active')}
               >
                 <Trophy className="w-3.5 h-3.5" />
                 Todos
                 <span className="tab-count">{baseMatches.length}</span>
               </button>
 
-              {availableStages.map(stage => {
-                const count = baseMatches.filter(m => m.stage === stage).length;
-                const isKnockout = KNOCKOUT_STAGES.has(stage);
+              {availableCompetitions.map(comp => {
+                const count = baseMatches.filter(m => m.competition === comp).length;
                 return (
                   <button
-                    key={stage}
-                    onClick={() => setStageFilter(stage)}
+                    key={comp}
+                    onClick={() => setCompetitionFilter(comp)}
                     className={cn(
                       'stage-tab',
-                      stageFilter === stage && 'active',
-                      isKnockout && 'stage-knockout',
+                      competitionFilter === comp && 'active',
                     )}
                   >
-                    {stage}
+                    {competitionLabel(comp)}
                     <span className="tab-count">{count}</span>
                   </button>
                 );
@@ -330,8 +336,8 @@ export default function HomePage() {
           pastCount={pastMatches.length}
           onShowPast={() => setShowPast(true)}
           onReload={load}
-          hasStageFilter={stageFilter !== 'Todos'}
-          onClearFilter={() => setStageFilter('Todos')}
+          hasStageFilter={competitionFilter !== 'Todos'}
+          onClearFilter={() => setCompetitionFilter('Todos')}
         />
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 slide-up" style={{ animationFillMode: 'forwards', animationDelay: '0.12s' }}>
@@ -406,14 +412,14 @@ function EmptyState({
       {hasStageFilter ? (
         <>
           <div className="text-center space-y-2 max-w-xs">
-            <h2 className="text-xl font-extrabold text-foreground/80">Sem jogos nesta fase</h2>
+            <h2 className="text-xl font-extrabold text-foreground/80">Sem jogos nesta competição</h2>
             <p className="text-muted-foreground text-xs leading-relaxed">
-              Não existem partidas em aberto cadastradas para a fase selecionada neste momento.
+              Não existem partidas em aberto cadastradas para a competição selecionada neste momento.
             </p>
           </div>
           <button onClick={onClearFilter} className="btn-secondary gap-2">
             <ChevronDown className="w-4 h-4" />
-            Exibir Todas as Fases
+            Exibir Todas as Competições
           </button>
         </>
       ) : hasMatches ? (

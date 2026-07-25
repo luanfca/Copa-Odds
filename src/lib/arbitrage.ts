@@ -4,7 +4,7 @@
  *  mercados de desarmes, faltas cometidas e faltas sofridas entre as casas.)
  */
 
-export type House = 'betfair' | 'betmgm' | 'superbet' | 'pitaco';
+export type House = 'betfair' | 'betmgm' | 'superbet' | 'bet365' | 'betsson' | 'pitaco';
 
 export interface OddEntry {
   house: House;

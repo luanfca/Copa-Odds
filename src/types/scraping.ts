@@ -35,6 +35,8 @@ export interface ScrapedOdd {
   market: string;
   /** URL direta para a aposta na casa. Opcional — nem todas as respostas de API fornecem. */
   url?: string;
+  /** Competição/liga (ex: 'premier_league', 'la_liga', 'brasileirao'). Opcional para retrocompatibilidade. */
+  competition?: string;
 }
 
 /**
@@ -48,5 +50,14 @@ export interface ScrapedMatch {
   dateTime: Date;
   /** Fase do torneio normalizada: 'Fase de Grupos', 'Oitavas de Final', etc. */
   stage: string;
+  /** Competição/liga (ex: 'premier_league', 'la_liga', 'brasileirao'). Opcional para retrocompatibilidade. */
+  competition?: string;
   odds: ScrapedOdd[];
+  /**
+   * Quando true, este ScrapedMatch serve apenas para preencher a `dateTime`
+   * real de um jogo (pois a casa não retornou odds de jogador). O merge não
+   * cria novo match com base nele, mas corrige a data de um match existente
+   * que foi criado por outra fonte com data "agora".
+   */
+  dateOnly?: boolean;
 }
