@@ -19,7 +19,6 @@ jobs:
       NODE_ENV: production
       AUTO_SCRAPE_ENABLED: "false"
       PREWARM_ON_START: "false"
-      SOFA_SERVER_URL: http://127.0.0.1:54545
       SCRAPE_SECRET: ${{ secrets.SCRAPE_SECRET }}
     steps:
       - uses: actions/checkout@v4
@@ -35,27 +34,17 @@ jobs:
       - name: Instalar Chromium
         run: npx playwright install --with-deps chromium
 
-      - name: Instalar e iniciar SofaScore
-        run: |
-          python3 -m pip install --disable-pip-version-check -r docker/requirements-sofa.txt
-          python3 -m gunicorn \
-            --chdir scripts \
-            --bind 127.0.0.1:54545 \
-            --workers 1 \
-            --threads 4 \
-            --timeout 90 \
-            sofascore_server:app > /tmp/sofascore.log 2>&1 &
-          for attempt in {1..30}; do
-            curl --fail --silent http://127.0.0.1:54545/health && break
-            sleep 1
-          done
-
       - name: Sincronizar banco
-        run: npx prisma db push --skip-generate
+        run: |
+          for attempt in {1..5}; do
+            if npx prisma db push --skip-generate; then
+              exit 0
+            fi
+            if [ "$attempt" = "5" ]; then
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
 
       - name: Executar lote diário completo
         run: npm run scrape
-
-      - name: Mostrar log do SofaScore em caso de falha
-        if: failure()
-        run: tail -n 300 /tmp/sofascore.log || true

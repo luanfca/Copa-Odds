@@ -129,26 +129,30 @@ export async function buildDailyDataset(
             : 'brasileirao';
 
         for (const market of HISTORY_MARKETS) {
-          let found = false;
-          for (const team of teams) {
-            const history = await getPlayerHistory(
-              player.displayName || player.name,
-              team,
-              market,
-              false,
-              {
-                maxGames: 10,
-                competition,
-                historyScope: 'league',
-              },
-            ).catch(() => null);
-            if (history?.entries?.length) {
-              historiesFilled++;
-              found = true;
-              break;
+          // Preenche os dois filtros usados pela interface. Os payloads dos
+          // jogos são compartilhados no cache; não há nova chamada por mercado.
+          for (const historyScope of ['league', 'all'] as const) {
+            let found = false;
+            for (const team of teams) {
+              const history = await getPlayerHistory(
+                player.displayName || player.name,
+                team,
+                market,
+                historyScope === 'all',
+                {
+                  maxGames: 10,
+                  competition,
+                  historyScope,
+                },
+              ).catch(() => null);
+              if (history?.entries?.length) {
+                historiesFilled++;
+                found = true;
+                break;
+              }
             }
+            if (!found) historiesMissing++;
           }
-          if (!found) historiesMissing++;
         }
       }),
     );
