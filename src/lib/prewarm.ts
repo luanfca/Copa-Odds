@@ -22,7 +22,8 @@ let prewarmDone = false;
  * para evitar execuções concorrentes. Se o processo falhar no meio, o cache
  * fica parcialmente populado, mas as requisições reais completam o que faltar.
  */
-export async function prewarmSofaScoreCache(): Promise<void> {
+export async function prewarmSofaScoreCache(force = false): Promise<void> {
+  if (force) prewarmDone = false;
   if (prewarmDone) return;
   prewarmDone = true; // trava reentrância imediatamente
 
@@ -97,4 +98,3 @@ export function startPeriodicPrewarm(intervalMs = 30 * 60 * 1000): void {
   }, intervalMs);
   console.log(`[PREWARM] Refresh periodico a cada ${intervalMs / 1000 / 60} min`);
 }
-

@@ -1,0 +1,30 @@
+name: Coleta diária completa
+
+on:
+  schedule:
+    # 06:00 em Fortaleza (UTC-3)
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: copa-odds-daily-collection
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Acordar o serviço
+        run: curl --fail --silent --show-error --retry 5 --retry-delay 15 --max-time 180 https://copa-odds.onrender.com/api/admin/health
+
+      - name: Executar lote diário
+        env:
+          SCRAPE_SECRET: ${{ secrets.SCRAPE_SECRET }}
+        run: |
+          test -n "$SCRAPE_SECRET"
+          curl --fail --silent --show-error \
+            --max-time 5100 \
+            --request POST \
+            --header "x-scrape-key: $SCRAPE_SECRET" \
+            https://copa-odds.onrender.com/api/scrape

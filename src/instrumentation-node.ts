@@ -43,14 +43,15 @@ export async function registerNodeRuntime() {
     console.error('[instrumentation] ApiSnapshot:', String(err));
   });
 
-  // 2) Pré-aquecimento SofaScore (histórico) — opcional, em background
-  //    Não bloqueia mais as abas principais (elas leem snapshot).
-  import('@/lib/prewarm').then(({ prewarmSofaScoreCache, startPeriodicPrewarm }) => {
-    prewarmSofaScoreCache();
-    startPeriodicPrewarm();
-  }).catch((err) => {
-    console.error('[instrumentation] Erro ao iniciar prewarm:', String(err));
-  });
+  // 2) O histórico agora é preenchido como parte do lote diário. O prewarm no
+  // startup fica opt-in para não disputar CPU com o site nem repetir chamadas.
+  if (process.env.PREWARM_ON_START === 'true') {
+    import('@/lib/prewarm').then(({ prewarmSofaScoreCache }) => {
+      prewarmSofaScoreCache();
+    }).catch((err) => {
+      console.error('[instrumentation] Erro ao iniciar prewarm:', String(err));
+    });
+  }
 
   // 3) Cron de scraping via HTTP
   initAutoScrape();
@@ -69,6 +70,10 @@ function isBuildProcess(): boolean {
  * Faz scraping a cada intervalo (default: 4h) chamando /api/scrape via HTTP.
  */
 function initAutoScrape(intervalMs = 4 * 60 * 60 * 1000): void {
+  if (process.env.AUTO_SCRAPE_ENABLED === 'false') {
+    console.log('[auto-scrape] Scheduler interno desativado; usando agenda externa diária.');
+    return;
+  }
   const schedule = process.env.CRON_SCHEDULE;
   if (schedule) {
     // Tenta interpretar CRON_SCHEDULE como intervalo em ms
@@ -135,7 +140,7 @@ async function doScrape(): Promise<void> {
       method: 'POST',
       headers,
       cache: 'no-store',
-      signal: AbortSignal.timeout(120_000), // 2 min timeout
+      signal: AbortSignal.timeout(60 * 60_000), // lote diário completo: até 60 min
     });
 
     if (res.ok) {

@@ -10,6 +10,7 @@ import {
   enrichJobKey,
   getEnrichJobStatus,
   isHistoryCoverageOk,
+  applyHistoryAnalysis,
 } from '@/lib/historyEnrich';
 import { applyRegularStarters } from '@/lib/starters';
 import { applyPredictedLineups } from '@/lib/lineups365';
@@ -22,7 +23,6 @@ import {
   setApiSnapshot,
   rankingSnapshotKey,
   buildLightRanking,
-  SNAPSHOT_MAX_AGE_MS,
 } from '@/lib/apiSnapshot';
 
 export const dynamic = 'force-dynamic';
@@ -188,17 +188,15 @@ export async function GET(request: NextRequest) {
   //    depois de scrape parcial ou escalação saindo e cache velho).
   if (!forceRefresh) {
     const snapMeta = await getApiSnapshotWithAge(snapKey);
-    if (snapMeta && snapMeta.ageMs < SNAPSHOT_MAX_AGE_MS) {
-      const body = await prepareBodyWithHistory(
-        sanitizeRankingBody(snapMeta.data),
-        market,
-        allComps,
-        maxGames,
-        year,
-        competition,
-        /* startJob */ true,
-        historyScope,
+    if (snapMeta) {
+      // O lote diário já contém histórico e escalações. Aqui só fazemos uma
+      // cópia e fatiamos 5/10 jogos em memória, sem chamadas externas.
+      const body = sanitizeRankingBody(
+        JSON.parse(JSON.stringify(snapMeta.data)),
       );
+      for (const player of body?.players ?? []) {
+        applyHistoryAnalysis(player, maxGames);
+      }
       return NextResponse.json(body, {
         headers: {
           'Cache-Control': 'public, s-maxage=15, stale-while-revalidate=30',
@@ -229,7 +227,7 @@ export async function GET(request: NextRequest) {
     }
 
     try {
-      const prev = snapMeta?.data ?? (await getApiSnapshot(snapKey));
+      const prev = await getApiSnapshot(snapKey);
       let light = sanitizeRankingBody(await buildLightRanking(market, allComps, competition));
       light = mergeHistoryFromPrev(light, prev);
       const body = await prepareBodyWithHistory(

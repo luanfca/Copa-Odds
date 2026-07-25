@@ -9,3 +9,9 @@ services:
         value: production
       - key: USE_MOCK
         value: "false"
+      - key: AUTO_SCRAPE_ENABLED
+        value: "false"
+      - key: PREWARM_ON_START
+        value: "false"
+      - key: SOFA_SERVER_URL
+        value: "http://127.0.0.1:54545"

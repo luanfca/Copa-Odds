@@ -304,28 +304,24 @@ export async function scrapeAll(): Promise<ScrapeResult> {
 
     const stats = await persistScrapedData(allData);
 
-    // Apaga odds antigas SÓ das casas que OK neste scrape (se betfair falhou,
-    // mantém odds betfair anteriores — evita sumir jogo pré-partida).
-    // Depois rebuild snapshots para as páginas abrirem instantâneas.
-    try {
-      const { purgeOldOdds, rebuildApiSnapshots, clearApiSnapshots } = await import('../lib/apiSnapshot');
-      await clearApiSnapshots();
-      const okHouses: string[] = [];
-      if (result.betfairOk) okHouses.push('betfair');
-      if (result.betmgmOk) okHouses.push('betmgm');
-      if (result.superbetOk) okHouses.push('superbet');
-      if (result.pitacoOk) okHouses.push('pitaco');
-      if (result.bet365Ok) okHouses.push('bet365');
-      if (result.betssonOk) okHouses.push('betsson');
-      const purged = await purgeOldOdds(scrapeLog.startedAt, okHouses);
-      logger.info(
-        `[Scrape] Odds antigas removidas: ${purged} (casas OK: ${okHouses.join(',') || 'nenhuma'})`,
-      );
-      await rebuildApiSnapshots();
-      logger.info('[Scrape] ApiSnapshots reconstruídos (páginas instantâneas)');
-    } catch (e) {
-      logger.error('[Scrape] Falha ao rebuild snapshots:', { error: String(e) });
-    }
+    // Mantém o lote anterior visível enquanto o novo é completado com
+    // históricos e escalações. A troca dos snapshots só acontece no final.
+    const { purgeOldOdds } = await import('../lib/apiSnapshot');
+    const okHouses: string[] = [];
+    if (result.betfairOk) okHouses.push('betfair');
+    if (result.betmgmOk) okHouses.push('betmgm');
+    if (result.superbetOk) okHouses.push('superbet');
+    if (result.pitacoOk) okHouses.push('pitaco');
+    if (result.bet365Ok) okHouses.push('bet365');
+    if (result.betssonOk) okHouses.push('betsson');
+    const purged = await purgeOldOdds(scrapeLog.startedAt, okHouses);
+    logger.info(
+      `[Scrape] Odds antigas removidas: ${purged} (casas OK: ${okHouses.join(',') || 'nenhuma'})`,
+    );
+
+    const { buildDailyDataset } = await import('../lib/dailyDataset');
+    const daily = await buildDailyDataset(scrapeLog.startedAt);
+    logger.info('[Scrape] Lote diário completo e publicado', daily);
 
     // Invalida caches in-memory
     const { invalidateDesCache, invalidateMatchCache, invalidateVoCache } = await import('../lib/cacheInvalidation');

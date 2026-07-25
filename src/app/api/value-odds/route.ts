@@ -272,13 +272,12 @@ export async function GET(request: NextRequest) {
         getApiSnapshotWithAge,
         setApiSnapshot,
         buildLightValueOdds,
-        SNAPSHOT_MAX_AGE_MS,
       } = await import('@/lib/apiSnapshot');
 
       let base: any = null;
       let cacheTag = 'SNAPSHOT';
       const snapMeta = await getApiSnapshotWithAge('value-odds');
-      if (snapMeta && snapMeta.ageMs < SNAPSHOT_MAX_AGE_MS) {
+      if (snapMeta) {
         base = snapMeta.data;
       } else if (voCache && age < 45_000) {
         base = voCache.body;
@@ -290,20 +289,35 @@ export async function GET(request: NextRequest) {
       }
 
       if (base?.opportunities) {
-        // Copia rasa para não mutar snapshot em disco sem querer
+        // O lote diário já contém histórico e escalação. Só fatia o histórico
+        // em memória; nenhuma fonte externa é consultada ao abrir a página.
         const body = {
           ...base,
-          opportunities: (base.opportunities as any[]).map((o) => ({ ...o })),
+          opportunities: (base.opportunities as any[]).map((o) => {
+            const copy = {
+              ...o,
+              player: o.player ? { ...o.player } : o.player,
+              history: o.history
+                ? { ...o.history, entries: [...(o.history.entries || [])] }
+                : null,
+            };
+            if (copy.history?.entries?.length > maxGames) {
+              copy.history.entries = copy.history.entries.slice(-maxGames);
+              copy.history.total = copy.history.entries.reduce(
+                (sum: number, entry: any) => sum + Number(entry.value || 0),
+                0,
+              );
+              copy.history.average = copy.history.entries.length
+                ? copy.history.total / copy.history.entries.length
+                : 0;
+            }
+            return copy;
+          }),
         };
-        await attachValueOddsHistory(body.opportunities, {
-          maxGames,
-          year,
-          historyScope,
-        });
         setVoCache(body, Date.now());
         return NextResponse.json(body, {
           headers: {
-            'X-Cache': `${cacheTag}+HIST`,
+            'X-Cache': `${cacheTag}+DAILY`,
             'Cache-Control': 'public, s-maxage=15, stale-while-revalidate=60',
           },
         });

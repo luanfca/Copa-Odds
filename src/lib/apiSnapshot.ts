@@ -13,7 +13,9 @@
 import { prisma } from './prisma';
 import { findBestOdds, type OddEntry } from './arbitrage';
 import { isLikelyPlayerName, isSamePlayer } from './normalize';
-import { computeProbableStarterIds } from './starters';
+import { applyRegularStarters, computeProbableStarterIds } from './starters';
+import { attachFullHistory } from './historyEnrich';
+import { applyPredictedLineups } from './lineups365';
 
 // NÃO importar winston/logger aqui — este módulo é carregado por instrumentation.ts
 // e o Next tenta bundlar winston no client/edge → "Can't resolve 'os'".
@@ -25,42 +27,12 @@ const log = {
 
 const HOUSES = new Set(['betfair', 'betmgm', 'superbet', 'pitaco']);
 
-let tableReady: Promise<void> | null = null;
-
-async function ensureTable(): Promise<void> {
-  if (!tableReady) {
-    tableReady = (async () => {
-      await prisma.$executeRawUnsafe(`
-        CREATE TABLE IF NOT EXISTS api_snapshots (
-          id TEXT PRIMARY KEY NOT NULL,
-          cacheKey TEXT NOT NULL UNIQUE,
-          kind TEXT NOT NULL,
-          data TEXT NOT NULL,
-          createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-      await prisma.$executeRawUnsafe(
-        `CREATE INDEX IF NOT EXISTS api_snapshots_kind_idx ON api_snapshots(kind)`,
-      );
-    })().catch((e) => {
-      tableReady = null;
-      throw e;
-    });
-  }
-  await tableReady;
-}
-
-function newId(): string {
-  return `snap_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
 export function rankingSnapshotKey(market: string, allComps = false, competition?: string): string {
   return `ranking:${market}:${allComps ? 'all' : 'def'}:${competition || 'all'}`;
 }
 
-/** Idade máxima do snapshot para servir sem rebuild (jogos pré-jogo somem se ficar velho). */
-export const SNAPSHOT_MAX_AGE_MS = 90_000; // 90s
+/** O lote diário continua válido até ser substituído pela próxima coleta. */
+export const SNAPSHOT_MAX_AGE_MS = 36 * 60 * 60 * 1000;
 
 export async function getApiSnapshot<T = unknown>(
   cacheKey: string,
@@ -73,54 +45,30 @@ export async function getApiSnapshotWithAge<T = unknown>(
   cacheKey: string,
 ): Promise<{ data: T; ageMs: number; updatedAt: Date } | null> {
   try {
-    await ensureTable();
-    const rows = await prisma.$queryRawUnsafe<
-      Array<{ data: string; updatedAt: string | Date }>
-    >(`SELECT data, updatedAt FROM api_snapshots WHERE cacheKey = ? LIMIT 1`, cacheKey);
-    if (!rows?.[0]?.data) return null;
-    const updatedAt = new Date(rows[0].updatedAt);
+    const row = await prisma.apiSnapshot.findUnique({ where: { cacheKey } });
+    if (!row?.data) return null;
+    const updatedAt = row.updatedAt;
     const ageMs = Number.isFinite(updatedAt.getTime())
       ? Date.now() - updatedAt.getTime()
       : Number.POSITIVE_INFINITY;
-    return { data: JSON.parse(rows[0].data) as T, ageMs, updatedAt };
+    return { data: JSON.parse(row.data) as T, ageMs, updatedAt };
   } catch {
     return null;
   }
 }
 
 export async function setApiSnapshot(cacheKey: string, kind: string, body: unknown): Promise<void> {
-  await ensureTable();
   const data = JSON.stringify(body);
-  const now = new Date().toISOString();
-  const existing = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
-    `SELECT id FROM api_snapshots WHERE cacheKey = ? LIMIT 1`,
-    cacheKey,
-  );
-  if (existing?.[0]?.id) {
-    await prisma.$executeRawUnsafe(
-      `UPDATE api_snapshots SET data = ?, kind = ?, updatedAt = ? WHERE cacheKey = ?`,
-      data,
-      kind,
-      now,
-      cacheKey,
-    );
-  } else {
-    await prisma.$executeRawUnsafe(
-      `INSERT INTO api_snapshots (id, cacheKey, kind, data, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
-      newId(),
-      cacheKey,
-      kind,
-      data,
-      now,
-      now,
-    );
-  }
+  await prisma.apiSnapshot.upsert({
+    where: { cacheKey },
+    update: { kind, data },
+    create: { cacheKey, kind, data },
+  });
 }
 
 export async function clearApiSnapshots(): Promise<void> {
   try {
-    await ensureTable();
-    await prisma.$executeRawUnsafe(`DELETE FROM api_snapshots`);
+    await prisma.apiSnapshot.deleteMany();
   } catch (e) {
     log.warn(`[ApiSnapshot] clear falhou: ${String(e)}`);
   }
@@ -230,9 +178,11 @@ export async function buildLightRanking(market: string, allComps = false, compet
       competition?: string;
     };
     isStarter: boolean;
+    starterSource?: string;
     odds: OddEntry[];
     bestByLine: Record<string, OddEntry>;
-    history: null;
+    history: any;
+    analysis?: any;
   };
 
   const results: PlayerResult[] = [];
@@ -335,7 +285,9 @@ export async function buildLightRanking(market: string, allComps = false, compet
 }
 
 /** Value-odds leve (sem histórico externo) a partir das odds do banco. */
-export async function buildLightValueOdds() {
+export async function buildLightValueOdds(
+  rankings?: Map<string, any>,
+) {
   const rankingMarkets = [
     'desarmes',
     'faltas_cometidas',
@@ -346,7 +298,7 @@ export async function buildLightValueOdds() {
   const opportunities: any[] = [];
 
   for (const market of rankingMarkets) {
-    const body = await buildLightRanking(market, true);
+    const body = rankings?.get(market) ?? await buildLightRanking(market, true);
     for (const p of body.players) {
       const byLine = new Map<string, OddEntry[]>();
       for (const o of p.odds) {
@@ -371,6 +323,7 @@ export async function buildLightValueOdds() {
             displayName: p.displayName,
             team: p.team,
             isProbableStarter: p.isStarter,
+            starterSource: p.starterSource,
           },
           match: p.match,
           market,
@@ -380,7 +333,8 @@ export async function buildLightValueOdds() {
           bestOddValue: best.value,
           secondBestOddValue: second.value,
           diffPct: parseFloat(diffPct.toFixed(1)),
-          history: null,
+          history: p.history ?? null,
+          analysis: p.analysis ?? null,
         });
       }
     }
@@ -455,24 +409,65 @@ const RANKING_MARKETS = [
   'chutes_ao_gol',
 ];
 
-export async function rebuildApiSnapshots(): Promise<void> {
+export async function rebuildApiSnapshots(
+  options: { includeHistory?: boolean; atomic?: boolean } = {},
+): Promise<void> {
   const t0 = Date.now();
-  await clearApiSnapshots();
+  const pending: Array<{ cacheKey: string; kind: string; body: any }> = [];
+  const valueRankings = new Map<string, any>();
 
   for (const market of RANKING_MARKETS) {
     for (const allComps of [false, true]) {
       const key = rankingSnapshotKey(market, allComps);
       const body = await buildLightRanking(market, allComps);
-      await setApiSnapshot(key, 'ranking', body);
+      if (options.includeHistory) {
+        const scope = allComps ? 'all' : 'league';
+        await attachFullHistory(
+          body.players,
+          market,
+          allComps,
+          10,
+          undefined,
+          scope,
+          undefined,
+        );
+        applyRegularStarters(body.players);
+        await applyPredictedLineups(body.players, 30_000);
+      }
+      pending.push({ cacheKey: key, kind: 'ranking', body });
+      if (allComps) valueRankings.set(market, body);
       log.info(`[ApiSnapshot] ${key}: ${body.players.length} jogadores`);
     }
   }
 
   const matchesBody = await buildLightMatches();
-  await setApiSnapshot('matches', 'matches', matchesBody);
+  pending.push({ cacheKey: 'matches', kind: 'matches', body: matchesBody });
 
-  const voBody = await buildLightValueOdds();
-  await setApiSnapshot('value-odds', 'value-odds', voBody);
+  const voBody = await buildLightValueOdds(valueRankings);
+  pending.push({ cacheKey: 'value-odds', kind: 'value-odds', body: voBody });
+
+  if (options.atomic) {
+    await prisma.$transaction(
+      pending.map((snapshot) =>
+        prisma.apiSnapshot.upsert({
+          where: { cacheKey: snapshot.cacheKey },
+          update: {
+            kind: snapshot.kind,
+            data: JSON.stringify(snapshot.body),
+          },
+          create: {
+            cacheKey: snapshot.cacheKey,
+            kind: snapshot.kind,
+            data: JSON.stringify(snapshot.body),
+          },
+        }),
+      ),
+    );
+  } else {
+    for (const snapshot of pending) {
+      await setApiSnapshot(snapshot.cacheKey, snapshot.kind, snapshot.body);
+    }
+  }
 
   log.info(
     `[ApiSnapshot] Rebuild OK em ${Date.now() - t0}ms — ${matchesBody.matches.length} jogos, ${voBody.opportunities.length} value-odds`,
