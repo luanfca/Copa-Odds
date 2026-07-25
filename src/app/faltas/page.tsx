@@ -100,6 +100,7 @@ export default function FaltasPage() {
     sortDir, setSortDir,
     maxGames, setMaxGames,
     historyScope, setHistoryScope,
+    hydrated,
   } = useRankingFilters('faltas', { selectedLine: '2+' });
   const { toggleFavorite, isFavorite } = useMarketFavorites(activeMarket);
   const now = useNow();
@@ -112,6 +113,7 @@ export default function FaltasPage() {
     market: activeMarket,
     cacheKey: `faltas_${activeMarket}_${selectedCompetition}_${historyScope}`,
     allComps,
+    enabled: hydrated,
     maxGames,
     year,
     competition: selectedCompetition,

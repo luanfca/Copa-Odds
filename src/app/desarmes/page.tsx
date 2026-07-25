@@ -88,6 +88,7 @@ export default function DesarmesPage() {
     sortDir, setSortDir,
     maxGames, setMaxGames,
     historyScope, setHistoryScope,
+    hydrated,
   } = useRankingFilters('desarmes', { selectedLine: '2+' });
   const { toggleFavorite, isFavorite } = useMarketFavorites('desarmes');
   const now = useNow();
@@ -110,6 +111,7 @@ export default function DesarmesPage() {
     market: 'desarmes',
     cacheKey,
     allComps,
+    enabled: hydrated,
     maxGames,
     year,
     competition: selectedCompetition,

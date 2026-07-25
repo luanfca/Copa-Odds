@@ -34,6 +34,8 @@ interface RankingLoadOpts {
   market: string;
   cacheKey: string;
   allComps: boolean;
+  /** Aguarda a hidratação dos filtros persistidos para não buscar duas vezes. */
+  enabled?: boolean;
   maxGames?: number;
   year?: number;
   competition?: string;
@@ -48,6 +50,7 @@ export function useRankingLoad(opts: RankingLoadOpts) {
     market,
     cacheKey,
     allComps,
+    enabled = true,
     maxGames,
     year,
     competition,
@@ -206,13 +209,14 @@ export function useRankingLoad(opts: RankingLoadOpts) {
   );
 
   useEffect(() => {
+    if (!enabled) return;
     void load();
     return () => {
       genRef.current++;
       stopPoll();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [market, allComps, maxGames, year, competition, historyScope, cacheKey]);
+  }, [enabled, market, allComps, maxGames, year, competition, historyScope, cacheKey]);
 
   // Ao voltar para a aba, puxa progresso do job sem reiniciar tudo
   useEffect(() => {

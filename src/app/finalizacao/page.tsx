@@ -119,6 +119,7 @@ export default function FinalizacaoPage() {
     sortDir, setSortDir,
     maxGames, setMaxGames,
     historyScope, setHistoryScope,
+    hydrated,
   } = useRankingFilters('finalizacao', { selectedLine: '1+' });
   const { toggleFavorite, isFavorite } = useMarketFavorites(activeMarket);
   const now = useNow();
@@ -133,6 +134,7 @@ export default function FinalizacaoPage() {
     market: activeMarket,
     cacheKey: `finalizacao_${activeMarket}_${selectedCompetition}_${historyScope}`,
     allComps,
+    enabled: hydrated,
     maxGames,
     year,
     competition: selectedCompetition,
