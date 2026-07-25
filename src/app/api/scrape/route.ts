@@ -2,7 +2,10 @@ import { NextResponse } from 'next/server';
 import { isScrapeRunning, setScrapeRunning, tryAcquireScrapeLock, releaseScrapeLock } from '@/lib/cron';
 
 // Chave de proteção lida do ambiente.
-const SCRAPE_SECRET = process.env.SCRAPE_SECRET ?? '';
+const SCRAPE_SECRET =
+  process.env.DAILY_CRON_SECRET ??
+  process.env.SCRAPE_SECRET ??
+  '';
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 /**
