@@ -202,16 +202,10 @@ export function Navbar() {
   // Baixa os snapshots estáticos quando o navegador fica ocioso. Assim a
   // troca Desarmes ↔ Faltas ↔ Finalização usa memória e abre imediatamente.
   useEffect(() => {
-    const start = () => void warmRankingTabs();
-    const win = window as Window & {
-      requestIdleCallback?: (callback: () => void, opts?: { timeout: number }) => number;
-      cancelIdleCallback?: (id: number) => void;
-    };
-    if (win.requestIdleCallback) {
-      const id = win.requestIdleCallback(start, { timeout: 2_500 });
-      return () => win.cancelIdleCallback?.(id);
-    }
-    const id = window.setTimeout(start, 1_200);
+    // Dá tempo para a aba atual preencher o cache primeiro; depois aquece só
+    // as demais. requestIdleCallback disparava cedo demais em máquinas rápidas
+    // e duplicava a primeira requisição.
+    const id = window.setTimeout(() => void warmRankingTabs(), 1_800);
     return () => window.clearTimeout(id);
   }, []);
 
