@@ -9,6 +9,7 @@
  */
 
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { chromium } from 'playwright';
 
 const HOST = process.env.SOFA_HOST || '127.0.0.1';
@@ -24,6 +25,11 @@ const PROXY_PREFIXES = (
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+const REQUEST_TOKEN = randomBytes(16).toString('hex');
+const SOFA_HEADERS = {
+  Accept: 'application/json, text/plain, */*',
+  'X-Requested-With': REQUEST_TOKEN,
+};
 
 let browserPromise;
 let pagePromise;
@@ -66,6 +72,7 @@ async function ensurePage() {
         userAgent: UA,
         locale: 'pt-BR',
         timezoneId: 'America/Sao_Paulo',
+        extraHTTPHeaders: SOFA_HEADERS,
       });
       const page = await context.newPage();
       const response = await page.goto(`${API}/sport/football/events/live`, {
@@ -86,16 +93,16 @@ async function ensurePage() {
 
 async function proxyGet(path) {
   let lastError;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 1; attempt++) {
     for (const prefix of PROXY_PREFIXES) {
       try {
         const response = await fetch(prefix + API + path, {
           headers: {
-            Accept: 'application/json, text/plain, */*',
+            ...SOFA_HEADERS,
             Origin: 'https://copa-odds.onrender.com',
             'User-Agent': UA,
           },
-          signal: AbortSignal.timeout(20_000),
+          signal: AbortSignal.timeout(10_000),
         });
         if (response.ok) return await response.json();
         lastError = new Error(
@@ -117,15 +124,18 @@ async function sofaGetFresh(path) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const page = await ensurePage();
-      const result = await page.evaluate(async (url) => {
+      const result = await page.evaluate(async ({ url, requestToken }) => {
         const response = await fetch(url, {
           cache: 'no-store',
           credentials: 'include',
-          headers: { Accept: 'application/json, text/plain, */*' },
+          headers: {
+            Accept: 'application/json, text/plain, */*',
+            'X-Requested-With': requestToken,
+          },
         });
         const text = await response.text();
         return { status: response.status, text };
-      }, API + path);
+      }, { url: API + path, requestToken: REQUEST_TOKEN });
       if (result.status === 200) return JSON.parse(result.text);
       lastError = new Error(`HTTP ${result.status} em ${path}`);
       if (result.status === 403) {
