@@ -91,25 +91,31 @@ export async function POST(request: Request) {
   }
   setScrapeRunning(true);
 
-  (async () => {
-    try {
-      const { scrapeAll } = await import('@/scraping/index');
-      await scrapeAll();
-      // Snapshots já são rebuildados no final do scrapeAll (apiSnapshot).
-      // Prewarm HTTP opcional — só se quiser aquecer edge/CDN; não bloqueia a UI.
-      prewarmCache().catch(() => null);
-    } catch {
-      // erro já logado dentro de scrapeAll
-    } finally {
-      setScrapeRunning(false);
-      await releaseScrapeLock();
-    }
-  })();
+  try {
+    // Em hospedagens que encerram o contexto da rota após enviar a resposta
+    // (como instâncias gratuitas), uma Promise solta não chega a executar.
+    // Esperar a coleta torna a execução confiável e mantém o lock durável.
+    const { scrapeAll } = await import('@/scraping/index');
+    const result = await scrapeAll();
+    // Snapshots já são rebuildados no final do scrapeAll (apiSnapshot).
+    prewarmCache().catch(() => null);
 
-  return NextResponse.json({
-    message: 'Scraping iniciado em background. Aguarde alguns minutos e recarregue a página.',
-    startedAt: new Date().toISOString(),
-  });
+    return NextResponse.json({
+      message: result.success
+        ? 'Varredura concluída com sucesso.'
+        : 'Varredura concluída, mas nenhuma fonte retornou dados.',
+      result,
+      finishedAt: new Date().toISOString(),
+    }, { status: result.success ? 200 : 502 });
+  } catch (error) {
+    return NextResponse.json(
+      { error: 'Falha ao executar a varredura.', details: String(error) },
+      { status: 500 },
+    );
+  } finally {
+    setScrapeRunning(false);
+    await releaseScrapeLock();
+  }
 }
 
 export async function GET() {
