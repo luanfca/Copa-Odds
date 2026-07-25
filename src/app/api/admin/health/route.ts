@@ -61,7 +61,9 @@ export async function GET(request: Request) {
   // Last scrape info
   try {
     const lastScrape = await prisma.scrapeLog.findFirst({
-      orderBy: { finishedAt: 'desc' },
+      // PostgreSQL ordena NULL antes de datas no DESC. Usar startedAt evita
+      // que uma execução antiga interrompida esconda a coleta mais recente.
+      orderBy: { startedAt: 'desc' },
     });
     if (lastScrape) {
       const ageMs = lastScrape.finishedAt
