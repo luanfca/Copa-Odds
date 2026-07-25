@@ -6,10 +6,10 @@
  */
 
 import {
-  getPlayerHistory,
   historyDbKey,
   type PlayerHistory,
 } from './sofascoreStats';
+import { getPlayerHistory } from './playerStats365';
 import { getSharedHistory, setSharedHistory } from './sharedCache';
 import { computeLineAnalysis } from './poisson';
 

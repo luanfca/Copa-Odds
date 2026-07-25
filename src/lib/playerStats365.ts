@@ -18,15 +18,18 @@ import {
   webwsJson,
 } from './lineups365';
 import { COMPETITIONS } from './competitions';
+import { normalizeName } from './normalize';
+import { setSharedHistory } from './sharedCache';
 
 /** type da stat no 365scores para cada mercado da nossa app. */
 export const MARKET_STAT_TYPE: Record<string, number> = {
   desarmes: 39,
   faltas_cometidas: 42,
   faltas_sofridas: 37,
-  // Chutes / finalizações (tipos comuns no payload de lineup do 365scores)
-  finalizacao: 44,
-  chutes_ao_gol: 45,
+  // Confirmados no payload /web/game: 3=chutes, 4=chutes no gol.
+  // O tipo 45 é toques na bola e não pode ser usado como finalização.
+  finalizacao: 3,
+  chutes_ao_gol: 4,
 };
 
 const MINUTES_TYPE = 30;
@@ -270,6 +273,8 @@ export interface HistoryEntry {
   value: number;
   /** Minutos jogados naquele jogo (null se desconhecido). */
   minutes: number | null;
+  /** ID imutável do jogo no 365Scores. */
+  eventId?: number;
 }
 
 export interface PlayerHistory {
@@ -284,21 +289,121 @@ export interface PlayerHistoryOpts {
   maxGames?: number;
   /** Filtra jogos pelo ano civil (ex: 2026). */
   year?: number;
+  /** Competição pedida pelo painel. */
+  competition?: string;
+  /** Liga principal ou todas as competições disponíveis. */
+  historyScope?: 'league' | 'all';
 }
 
 /**
- * Histórico do jogador — **somente SofaScore** (desarmes/faltas/chutes corretos).
- * O 365scores gerava médias erradas; assinatura mantida para as rotas existentes.
+ * Mantém a mesma chave histórica usada pelo restante da aplicação. Assim,
+ * snapshots e rotas podem trocar a fonte sem invalidar o contrato do cache.
+ */
+function historyDbKey365(
+  playerName: string,
+  team: string,
+  market: string,
+  allComps: boolean,
+  opts?: PlayerHistoryOpts,
+): string {
+  const scope =
+    opts?.historyScope === 'all' || allComps
+      ? 'all'
+      : `league:${opts?.competition || 'brasileirao'}`;
+  return [
+    'hist-v12',
+    normalizeName(team),
+    normalizeName(playerName),
+    market,
+    scope,
+    opts?.year ?? 'cur',
+  ].join('::');
+}
+
+/**
+ * Histórico do jogador via 365Scores.
+ *
+ * Os jogos e estatísticas são buscados uma única vez e ficam no promise-cache
+ * por gameId; todos os jogadores e mercados reutilizam o mesmo payload.
  */
 export async function getPlayerHistory(
   playerName: string,
   team: string,
   market: string,
   allComps = false,
-  opts?: PlayerHistoryOpts & { competition?: string },
+  opts?: PlayerHistoryOpts,
 ): Promise<PlayerHistory | null> {
-  const { getPlayerHistory: getSofaHistory } = await import('./sofascoreStats');
-  return getSofaHistory(playerName, team, market, allComps, opts);
+  const statType = MARKET_STAT_TYPE[market];
+  if (statType == null || !playerName || !team) return null;
+
+  const maxGames = Math.max(1, Math.min(opts?.maxGames ?? 10, 10));
+  const tslug = teamSlug(team);
+  let games = (allComps || opts?.historyScope === 'all'
+    ? await getFinishedGamesAllComps()
+    : await getFinishedGames()
+  ).filter(
+    (g) => teamSlugMatch(g.homeSlug, tslug) || teamSlugMatch(g.awaySlug, tslug),
+  );
+
+  if (opts?.year != null && Number.isFinite(opts.year)) {
+    games = games.filter((g) => new Date(g.start).getFullYear() === opts.year);
+  }
+
+  // Procura até 30 jogos para encontrar as 10 aparições mais recentes.
+  const scan = games
+    .sort((a, b) => (a.start < b.start ? 1 : -1))
+    .slice(0, Math.max(maxGames * 3, 24));
+  const entries: HistoryEntry[] = [];
+
+  // A própria webwsJson limita a concorrência global; Promise.all aqui permite
+  // preencher o cache por jogo rapidamente sem sobrecarregar o 365Scores.
+  await Promise.all(
+    scan.map(async (game) => {
+      try {
+        const members = await getGameMemberStats(game.gameId);
+        const player = members.find(
+          (member) =>
+            teamSlugMatch(member.teamSlug, tslug) &&
+            isNameMatch(playerName, member.name),
+        );
+        if (!player) return;
+
+        const minutes = parseStatNumber(player.statsByType.get(MINUTES_TYPE));
+        if (minutes != null && minutes <= 0) return;
+
+        const raw = player.statsByType.get(statType);
+        const value =
+          raw == null
+            ? 0
+            : TOTAL_STAT_TYPES.has(statType)
+              ? parseStatTotal(raw) ?? 0
+              : parseStatNumber(raw) ?? 0;
+        const homeIsTeam = teamSlugMatch(game.homeSlug, tslug);
+        entries.push({
+          date: game.start,
+          opponent: homeIsTeam ? game.awayName : game.homeName,
+          value,
+          minutes,
+          eventId: Number(game.gameId) || undefined,
+        });
+      } catch {
+        /* Uma partida inválida não invalida o histórico inteiro. */
+      }
+    }),
+  );
+
+  entries.sort((a, b) => (a.date < b.date ? -1 : 1));
+  const kept = entries.length > maxGames ? entries.slice(-maxGames) : entries;
+  const total = kept.reduce((sum, entry) => sum + entry.value, 0);
+  const history: PlayerHistory = {
+    market,
+    entries: kept,
+    total,
+    average: kept.length ? total / kept.length : 0,
+  };
+  const key = historyDbKey365(playerName, team, market, allComps, opts);
+  await setSharedHistory(key, history).catch(() => null);
+  return kept.length ? history : null;
 }
 
 // ─── Histórico de TIME (soma de todos os jogadores por jogo) ──────────────

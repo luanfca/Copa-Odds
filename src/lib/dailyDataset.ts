@@ -1,7 +1,6 @@
 import { prisma } from './prisma';
-import { getPlayerHistory } from './sofascoreStats';
+import { getFinishedGames, getPlayerHistory } from './playerStats365';
 import { getStartersForMatch } from './lineups365';
-import { prewarmSofaScoreCache } from './prewarm';
 import { rebuildApiSnapshots } from './apiSnapshot';
 
 const HISTORY_MARKETS = [
@@ -70,13 +69,13 @@ export async function buildDailyDataset(
     `[DailyDataset] Iniciando: ${players.length} jogadores, ${matches.size} jogos`,
   );
 
-  // Atualiza a lista de eventos uma única vez por time. Os históricos abaixo
-  // reutilizam CacheTeamEvents e CachePlayerStats, evitando jogador x mercado
-  // chamadas externas repetidas.
-  const prewarm = await prewarmSofaScoreCache(true);
-  if (players.length > 0 && prewarm.events === 0) {
+  // Valida a fonte de histórico antes de substituir qualquer snapshot.
+  // getGameMemberStats mantém promise-cache por jogo, então todos os jogadores
+  // e mercados abaixo reutilizam os mesmos payloads do 365Scores.
+  const finishedGames = await getFinishedGames();
+  if (players.length > 0 && finishedGames.length === 0) {
     throw new Error(
-      'SofaScore não retornou eventos; lote anterior mantido para evitar publicar históricos vazios.',
+      '365Scores não retornou jogos finalizados; lote anterior mantido para evitar publicar históricos vazios.',
     );
   }
 
