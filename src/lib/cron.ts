@@ -33,17 +33,23 @@ export async function tryAcquireScrapeLock(): Promise<boolean> {
 
     if (last?.status === 'running') {
       const age = Date.now() - last.startedAt.getTime();
-      if (age < STALE_LOCK_MS) {
-        isRunning = true;
+      // Se este processo sabe que há uma coleta ativa, preserva o lock.
+      if (isRunning && age < STALE_LOCK_MS) {
         return false;
       }
-      // Stale: marca como failed e permite novo scrape
+
+      // Memória livre + DB "running" significa que o contêiner que iniciou
+      // aquela coleta foi reiniciado. Recupera imediatamente; esperar 45 min
+      // faria a agenda diária falhar depois de qualquer deploy.
       await prisma.scrapeLog.update({
         where: { id: last.id },
         data: {
           status: 'failed',
           finishedAt: new Date(),
-          errorMsg: 'Lock expirado (stale running)',
+          errorMsg:
+            age >= STALE_LOCK_MS
+              ? 'Lock expirado (stale running)'
+              : 'Coleta interrompida por reinicialização do serviço',
         },
       }).catch(() => null);
     }
