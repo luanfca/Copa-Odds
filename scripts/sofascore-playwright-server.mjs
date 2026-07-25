@@ -14,13 +14,18 @@ import { chromium } from 'playwright';
 const HOST = process.env.SOFA_HOST || '127.0.0.1';
 const PORT = Number(process.env.SOFA_PORT || 54545);
 const API = 'https://www.sofascore.com/api/v1';
+const PROXY_PREFIX =
+  process.env.SOFA_PROXY_PREFIX || 'https://proxy.cors.sh/';
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
 
 let browserPromise;
 let pagePromise;
+let proxyMode = process.env.SOFA_FORCE_PROXY === 'true';
 const teamIdCache = new Map();
+const responseCache = new Map();
+const inflight = new Map();
 
 function normalize(value) {
   return String(value || '')
@@ -74,7 +79,29 @@ async function ensurePage() {
   return pagePromise;
 }
 
-async function sofaGet(path) {
+async function proxyGet(path) {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(PROXY_PREFIX + API + path, {
+        headers: {
+          Accept: 'application/json, text/plain, */*',
+          'User-Agent': UA,
+        },
+      });
+      if (response.ok) return await response.json();
+      lastError = new Error(`Proxy HTTP ${response.status} em ${path}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 700 * (attempt + 1)));
+  }
+  throw lastError || new Error(`Falha no proxy SofaScore em ${path}`);
+}
+
+async function sofaGetFresh(path) {
+  if (proxyMode) return proxyGet(path);
+
   let lastError;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -90,13 +117,38 @@ async function sofaGet(path) {
       }, API + path);
       if (result.status === 200) return JSON.parse(result.text);
       lastError = new Error(`HTTP ${result.status} em ${path}`);
+      if (result.status === 403) {
+        proxyMode = true;
+        return proxyGet(path);
+      }
     } catch (error) {
       lastError = error;
       pagePromise = undefined;
+      if (/403/.test(String(error))) {
+        proxyMode = true;
+        return proxyGet(path);
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
   }
   throw lastError || new Error(`Falha SofaScore em ${path}`);
+}
+
+async function sofaGet(path) {
+  const now = Date.now();
+  const cached = responseCache.get(path);
+  if (cached && cached.expires > now) return cached.data;
+  if (inflight.has(path)) return inflight.get(path);
+
+  const request = sofaGetFresh(path)
+    .then((data) => {
+      const ttl = path.includes('/events/live') ? 15_000 : 6 * 60 * 60_000;
+      responseCache.set(path, { data, expires: Date.now() + ttl });
+      return data;
+    })
+    .finally(() => inflight.delete(path));
+  inflight.set(path, request);
+  return request;
 }
 
 async function resolveTeamId(teamName) {
@@ -245,7 +297,10 @@ const server = http.createServer(async (request, response) => {
   const url = new URL(request.url || '/', `http://${HOST}:${PORT}`);
   try {
     if (url.pathname === '/health') {
-      return send(response, 200, { status: 'ok', engine: 'chromium' });
+      return send(response, 200, {
+        status: 'ok',
+        engine: proxyMode ? 'proxy' : 'chromium',
+      });
     }
     if (url.pathname === '/live') {
       return send(

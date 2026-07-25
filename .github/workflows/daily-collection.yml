@@ -19,6 +19,7 @@ jobs:
       NODE_ENV: production
       AUTO_SCRAPE_ENABLED: "false"
       PREWARM_ON_START: "false"
+      SOFA_FORCE_PROXY: "true"
       SCRAPE_SECRET: ${{ secrets.SCRAPE_SECRET }}
     steps:
       - uses: actions/checkout@v4
@@ -31,14 +32,11 @@ jobs:
       - name: Instalar aplicação
         run: npm ci
 
-      - name: Instalar Chromium
-        run: npx playwright install --with-deps chromium
-
-      - name: Iniciar SofaScore via Chromium
+      - name: Iniciar gateway SofaScore
         run: |
           node scripts/sofascore-playwright-server.mjs > /tmp/sofascore.log 2>&1 &
           for attempt in {1..30}; do
-            if curl --fail --silent http://127.0.0.1:54545/health; then
+            if curl --fail --silent http://127.0.0.1:54545/live > /dev/null; then
               exit 0
             fi
             sleep 1
