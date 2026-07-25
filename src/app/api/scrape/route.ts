@@ -52,7 +52,14 @@ function isAuthorized(request: Request): boolean {
   if (IS_PROD && !SCRAPE_SECRET) return false;
   if (!SCRAPE_SECRET) return true; // dev local sem secret
   const key = request.headers.get('x-scrape-key') ?? '';
-  return key === SCRAPE_SECRET;
+  if (key === SCRAPE_SECRET) return true;
+
+  // A ação manual parte do próprio painel. Assim, o segredo permanece
+  // exclusivamente no servidor para os jobs internos, sem quebrar o botão
+  // "Coletar" em uma instalação pública.
+  const origin = request.headers.get('origin');
+  const host = request.headers.get('host');
+  return Boolean(origin && host && origin === `https://${host}`);
 }
 
 export async function POST(request: Request) {
