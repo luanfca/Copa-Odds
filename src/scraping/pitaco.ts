@@ -41,6 +41,72 @@ for (const [key, val] of Object.entries(RAW_MARKET_MAP)) {
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms))
 
+const PITACO_GRPC_HEADERS: Record<string, string> = {
+  'content-type': 'application/grpc-web+proto',
+  'x-grpc-web': '1',
+  'x-user-agent': 'connect-es/2.1.1',
+  origin: PITACO_BASE,
+  referer: `${PITACO_BASE}/`,
+  platform: 'turbo_lite_desktop',
+  product: 'betting',
+  supported_products: 'regulated',
+  app_version: '888.888.888',
+  user_tracking_platform: 'turbo_lite_desktop',
+}
+
+function grpcFrame(payload: Uint8Array): Uint8Array {
+  const body = new Uint8Array(5 + payload.length)
+  new DataView(body.buffer).setUint32(1, payload.length, false)
+  body.set(payload, 5)
+  return body
+}
+
+function competitionRequestBody(competitionId: string): Uint8Array {
+  const id = new TextEncoder().encode(competitionId)
+  return grpcFrame(Uint8Array.from([10, id.length, ...id]))
+}
+
+function eventTabRequestBody(eventId: string): Uint8Array {
+  const encoder = new TextEncoder()
+  const tab = encoder.encode(`${eventId}::7`)
+  const id = encoder.encode(eventId)
+  const nested = Uint8Array.from([
+    10, tab.length, ...tab,
+    26, 1, 55, // tab/category "7" = jogadores
+  ])
+  return grpcFrame(Uint8Array.from([
+    10, nested.length, ...nested,
+    34, id.length, ...id,
+  ]))
+}
+
+async function fetchPitacoGrpc(
+  path: string,
+  body: Uint8Array,
+): Promise<Uint8Array | null> {
+  try {
+    // Copia para ArrayBuffer puro: o tipo genérico de Uint8Array também aceita
+    // SharedArrayBuffer, que não faz parte de BodyInit nas tipagens do Next.
+    const requestBody = Uint8Array.from(body).buffer
+    const response = await fetch(`${PITACO_BASE}/api/${path}`, {
+      method: 'POST',
+      headers: PITACO_GRPC_HEADERS,
+      body: requestBody,
+      cache: 'no-store',
+      signal: AbortSignal.timeout(20_000),
+    })
+    if (!response.ok) {
+      logger.warn(`[Pitaco] API direta HTTP ${response.status}: ${path}`)
+      return null
+    }
+    const data = new Uint8Array(await response.arrayBuffer())
+    return data.length >= 100 ? data : null
+  } catch (error) {
+    logger.warn(`[Pitaco] API direta falhou: ${path}`, { error: String(error) })
+    return null
+  }
+}
+
 // Set para logar mercados desconhecidos apenas uma vez por sessão
 const loggedUnknownMarkets = new Set<string>();
 
@@ -58,7 +124,7 @@ const textDecoder = new TextDecoder('utf-8', { fatal: false })
  * campeonatos são varints nessa resposta; as strings numéricas encontradas
  * aqui são justamente os eventos apresentados na aba "Partidas".
  */
-function extractCompetitionEventIds(buf: Uint8Array): string[] {
+export function extractCompetitionEventIds(buf: Uint8Array): string[] {
   const ids = new Set<string>()
 
   const walk = (node: Node | undefined, depth: number) => {
@@ -83,7 +149,7 @@ function extractCompetitionEventIds(buf: Uint8Array): string[] {
 }
 
 // Parse protobuf
-function parseMarkets(root: Node): Map<string, Array<{ player: string; team: string; line: string; outcomeId: string }>> {
+export function parseMarkets(root: Node): Map<string, Array<{ player: string; team: string; line: string; outcomeId: string }>> {
   const markets = new Map<string, Array<{ player: string; team: string; line: string; outcomeId: string }>>()
   for (const M of subAll(root, 1)) {
     const W = sub(M, 1)
@@ -118,7 +184,7 @@ function parseMarkets(root: Node): Map<string, Array<{ player: string; team: str
   return markets
 }
 
-function parseOdds(root: Node): Map<string, number> {
+export function parseOdds(root: Node): Map<string, number> {
   const odds = new Map<string, number>()
   for (const entry of subAll(root, 2)) {
     const inner = sub(entry, 2)
@@ -135,7 +201,7 @@ function parseOdds(root: Node): Map<string, number> {
   return odds
 }
 
-function extractTeams(root: Node): string[] {
+export function extractTeams(root: Node): string[] {
   const teams = new Set<string>()
   for (const M of subAll(root, 1)) {
     const W = sub(M, 1)
@@ -161,67 +227,77 @@ export async function scrapePitaco(context: BrowserContext, competitionKeys?: st
       const compId = COMPETITION_IDS[compKey];
       logger.info(`[Pitaco] Buscando jogos da competição: ${compKey} (ID: ${compId})`);
 
-      const compPage = await context.newPage()
       const compUrl = `${PITACO_BASE}/betting/competitions/${compId}?tab=matches`
       // Coleta event IDs de hrefs E da resposta protobuf oficial.
       const networkIds = new Set<string>()
-      compPage.on('response', async (resp) => {
-        try {
-          const u = resp.url()
-          if (!/competition|event|match|betting/i.test(u)) return
-          if (u.includes('GetUiCompetitionTabContent')) {
-            const body = new Uint8Array(await resp.body())
-            for (const id of extractCompetitionEventIds(body)) networkIds.add(id)
-            return
-          }
-          const txt = await resp.text().catch(() => '')
-          for (const m of txt.matchAll(/\/betting\/events\/(\d{8,})/g)) {
-            networkIds.add(m[1])
-          }
-          for (const m of txt.matchAll(/"eventId"\s*:\s*"?(\d{8,})"?/g)) {
-            networkIds.add(m[1])
-          }
-          for (const m of txt.matchAll(/"id"\s*:\s*"?(13\d{8,})"?/g)) {
-            networkIds.add(m[1])
-          }
-        } catch { /* */ }
-      })
-      await compPage.goto(compUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
-      // SPA lazy: espera links de eventos (até ~15s)
-      try {
-        await compPage.waitForSelector('a[href*="/betting/events/"]', { timeout: 15000 })
-      } catch {
-        /* tenta mesmo assim após waits extras */
-      }
-      await compPage.waitForTimeout(3000)
-      // scroll leve p/ forçar lazy list
-      for (let s = 0; s < 6; s++) {
-        await compPage.evaluate(() => window.scrollBy(0, 700))
-        await compPage.waitForTimeout(350)
-      }
-
-      let hrefs = await compPage.evaluate(() =>
-        [...new Set(Array.from(document.querySelectorAll('a[href*="/betting/events/"]'))
-          .map(a => (a as HTMLAnchorElement).href))]
+      const directCompetition = await fetchPitacoGrpc(
+        `${COMP_SERVICE}/GetUiCompetitionPage`,
+        competitionRequestBody(compId),
       )
-      // fallback: qualquer href com /events/
-      if (hrefs.length === 0) {
-        hrefs = await compPage.evaluate(() =>
-          [...new Set(
-            Array.from(document.querySelectorAll('a[href]'))
-              .map(a => (a as HTMLAnchorElement).href)
-              .filter(h => /\/betting\/events\/\d+/.test(h)),
-          )]
-        )
-      }
-      // fallback: texto da página com URLs
-      if (hrefs.length === 0) {
-        const html = await compPage.content()
-        for (const m of html.matchAll(/\/betting\/events\/(\d{8,})/g)) {
-          hrefs.push(`${PITACO_BASE}/betting/events/${m[1]}`)
+      if (directCompetition) {
+        for (const id of extractCompetitionEventIds(directCompetition)) {
+          networkIds.add(id)
         }
       }
-      await compPage.close().catch(() => null)
+
+      let hrefs: string[] = []
+      if (networkIds.size === 0) {
+        const compPage = await context.newPage()
+        compPage.on('response', async (resp) => {
+          try {
+            const u = resp.url()
+            if (!/competition|event|match|betting/i.test(u)) return
+            if (
+              u.includes('GetUiCompetitionTabContent') ||
+              u.includes('GetUiCompetitionPage')
+            ) {
+              const body = new Uint8Array(await resp.body())
+              for (const id of extractCompetitionEventIds(body)) networkIds.add(id)
+              return
+            }
+            const txt = await resp.text().catch(() => '')
+            for (const m of txt.matchAll(/\/betting\/events\/(\d{8,})/g)) {
+              networkIds.add(m[1])
+            }
+            for (const m of txt.matchAll(/"eventId"\s*:\s*"?(\d{8,})"?/g)) {
+              networkIds.add(m[1])
+            }
+            for (const m of txt.matchAll(/"id"\s*:\s*"?(13\d{8,})"?/g)) {
+              networkIds.add(m[1])
+            }
+          } catch { /* */ }
+        })
+        await compPage.goto(compUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
+        try {
+          await compPage.waitForSelector('a[href*="/betting/events/"]', { timeout: 15000 })
+        } catch { /* tenta mesmo assim após waits extras */ }
+        await compPage.waitForTimeout(3000)
+        for (let s = 0; s < 6; s++) {
+          await compPage.evaluate(() => window.scrollBy(0, 700))
+          await compPage.waitForTimeout(350)
+        }
+
+        hrefs = await compPage.evaluate(() =>
+          [...new Set(Array.from(document.querySelectorAll('a[href*="/betting/events/"]'))
+            .map(a => (a as HTMLAnchorElement).href))]
+        )
+        if (hrefs.length === 0) {
+          hrefs = await compPage.evaluate(() =>
+            [...new Set(
+              Array.from(document.querySelectorAll('a[href]'))
+                .map(a => (a as HTMLAnchorElement).href)
+                .filter(h => /\/betting\/events\/\d+/.test(h)),
+            )]
+          )
+        }
+        if (hrefs.length === 0) {
+          const html = await compPage.content()
+          for (const m of html.matchAll(/\/betting\/events\/(\d{8,})/g)) {
+            hrefs.push(`${PITACO_BASE}/betting/events/${m[1]}`)
+          }
+        }
+        await compPage.close().catch(() => null)
+      }
 
       const rawIds = [
         ...hrefs.map(h => h.match(/\/events\/(\d+)/)?.[1]).filter(Boolean) as string[],
@@ -229,6 +305,7 @@ export async function scrapePitaco(context: BrowserContext, competitionKeys?: st
       ]
       const eventIds = rawIds
         .filter(id => id !== compId)
+        .filter(id => /^133\d{8}$/.test(id))
         .filter((id, i, arr) => arr.indexOf(id) === i)
         .slice(0, MAX_GAMES_PER_COMP)
 
@@ -245,35 +322,36 @@ export async function scrapePitaco(context: BrowserContext, competitionKeys?: st
         const batchResults = await Promise.allSettled(
           batch.map(async (eventId) => {
             try {
-              const gamePage = await context.newPage()
-              let grpcBody: Uint8Array | null = null
-
-              gamePage.on('response', async (resp) => {
-                if (resp.url().includes('GetUiEventTabContent')) {
-                  try { grpcBody = new Uint8Array(await resp.body()) } catch {}
-                }
-              })
-
               const tabUrl = `${PITACO_BASE}/betting/events/${eventId}?tab=${eventId}::7`
-              await gamePage.goto(tabUrl, { waitUntil: 'load', timeout: 20000 })
+              let grpcBody = await fetchPitacoGrpc(
+                'ui_betting_events_components.UiBettingEventService/GetUiEventTabContent',
+                eventTabRequestBody(eventId),
+              )
 
-              // Espera gRPC inicial (até 10s)
-              const t0 = Date.now()
-              while (!(grpcBody as Uint8Array | null) && Date.now() - t0 < 10000) {
-                await delay(100)
+              if (!grpcBody) {
+                const gamePage = await context.newPage()
+                gamePage.on('response', async (resp) => {
+                  if (resp.url().includes('GetUiEventTabContent')) {
+                    try { grpcBody = new Uint8Array(await resp.body()) } catch {}
+                  }
+                })
+                await gamePage.goto(tabUrl, { waitUntil: 'load', timeout: 20000 })
+                const t0 = Date.now()
+                while (!grpcBody && Date.now() - t0 < 10000) {
+                  await delay(100)
+                }
+                await gamePage.close().catch(() => null)
               }
 
-              if (!(grpcBody as Uint8Array | null) || (grpcBody as Uint8Array | null)!.length < 100) {
-                await gamePage.close().catch(() => null)
+              if (!grpcBody || grpcBody.length < 100) {
                 return null
               }
 
-              const root = decode(ungrpc(grpcBody!))
+              const root = decode(ungrpc(grpcBody))
               const markets = parseMarkets(root)
               const odds = parseOdds(root)
 
               if (markets.size === 0 || odds.size === 0) {
-                await gamePage.close().catch(() => null)
                 return null
               }
 
@@ -300,8 +378,6 @@ export async function scrapePitaco(context: BrowserContext, competitionKeys?: st
                   })
                 }
               }
-
-              await gamePage.close().catch(() => null)
 
               if (scrapedOdds.length > 0) {
                 const teams = extractTeams(root)

@@ -298,6 +298,15 @@ export async function scrapeAll(): Promise<ScrapeResult> {
           logger.info(`${name}: ${data.length} jogos`);
         }
       }
+
+      // A etapa seguinte pré-calcula centenas de históricos. No Render Free,
+      // manter o Chromium ocioso durante esse trabalho ainda consumia memória
+      // suficiente para reiniciar o contêiner. Libera-o assim que as casas
+      // terminam; o finally abaixo continua como rede de segurança.
+      await sharedBrowser?.close().catch(() => null);
+      sharedBrowser = undefined;
+      browserLaunchPromise = null;
+      logger.info('Playwright encerrado antes do pré-cálculo diário.');
     }
 
     // ── Unifica e persiste ──

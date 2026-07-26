@@ -559,6 +559,7 @@ export function normalizeTeamName(teamName: string): string {
     'miami':               'Inter Miami',
     'la galaxy':           'LA Galaxy',
     'los angeles galaxy': 'LA Galaxy',
+    'los angeles gala':   'LA Galaxy',
     'galaxy':              'LA Galaxy',
     'lafc':                'Los Angeles FC',
     'la fc':               'Los Angeles FC',

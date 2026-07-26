@@ -425,9 +425,15 @@ async function discoverBetfairMatchesViaBff(
           timeout: PAGE_TIMEOUT_MS,
         },
       );
-      if (!response.ok()) continue;
+      if (!response.ok()) {
+        logger.warn(
+          `[Betfair] BFF semente ${eventId}: HTTP ${response.status()}.`,
+        );
+        continue;
+      }
       const data = await response.json();
-      const urls = [...collectBetfairEventUrls(data)]
+      const discoveredUrls = [...collectBetfairEventUrls(data)];
+      const urls = discoveredUrls
         .filter((url) =>
           competitionKey === 'brasileirao'
             ? /brasileir/i.test(url)
@@ -441,6 +447,10 @@ async function discoverBetfairMatchesViaBff(
         );
         return urls;
       }
+      logger.warn(
+        `[Betfair] BFF semente ${eventId}: resposta sem URLs da competição ` +
+        `(URLs totais=${discoveredUrls.length}).`,
+      );
     } catch (error) {
       logger.debug(`[Betfair] Semente ${eventId} falhou`, { error: String(error) });
     }

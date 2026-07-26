@@ -1,4 +1,4 @@
-import { isSamePlayer } from '../src/lib/normalize';
+import { isSamePlayer, normalizeTeamName } from '../src/lib/normalize';
 
 describe('isSamePlayer — regressões de nomes completos', () => {
   const cases: [string, string, boolean][] = [
@@ -30,5 +30,11 @@ describe('isSamePlayer — regressões de nomes completos', () => {
 
   test.each(cases)('compara "%s" com "%s"', (a, b, expected) => {
     expect(isSamePlayer(a, b)).toBe(expected);
+  });
+});
+
+describe('normalizeTeamName — regressões de fontes', () => {
+  test('recupera o nome truncado do LA Galaxy', () => {
+    expect(normalizeTeamName('Los Angeles Gala')).toBe('LA Galaxy');
   });
 });
