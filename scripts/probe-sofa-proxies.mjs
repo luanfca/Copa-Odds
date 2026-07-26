@@ -59,3 +59,43 @@ async function probe([name, url]) {
 }
 
 await Promise.all(candidates.map(probe));
+
+async function probeFotmob() {
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(
+      'https://www.fotmob.com/api/data/matchDetails?matchId=5103475',
+      {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+    const data = await response.json();
+    const cuiabano = Object.values(data?.content?.playerStats ?? {}).find(
+      (player) => player?.name === 'Cuiabano',
+    );
+    const tackle = (cuiabano?.stats ?? [])
+      .flatMap((group) => Object.values(group?.stats ?? {}))
+      .find((item) => item?.key === 'matchstats.headers.tackles')
+      ?.stat?.value;
+    console.log(
+      JSON.stringify({
+        name: 'fotmob-match',
+        status: response.status,
+        ms: Date.now() - startedAt,
+        players: Object.keys(data?.content?.playerStats ?? {}).length,
+        cuiabanoTackles: tackle,
+      }),
+    );
+  } catch (error) {
+    console.log(
+      JSON.stringify({
+        name: 'fotmob-match',
+        ms: Date.now() - startedAt,
+        error: String(error),
+      }),
+    );
+  }
+}
+
+await probeFotmob();

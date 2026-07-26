@@ -16,6 +16,10 @@ import {
   setCachePlayerHistory,
 } from './sqliteCache';
 import { COMPETITIONS } from './competitions';
+import {
+  getFotmobEventPlayerStats,
+  getFotmobTeamFinishedEvents,
+} from './fotmobHistory';
 
 // ── Constantes ───────────────────────────────────────────────────────────────
 
@@ -416,13 +420,21 @@ export async function getTeamFinishedEvents(
   competitionName?: string,
   tournamentId?: number,
 ): Promise<SofaTeamEvent[]> {
-  const cacheKey = `tev-v2_${normalizeName(teamName)}_${tournamentId ?? (competitionName ? normalizeName(competitionName) : 'all')}`;
+  const cacheKey = `tev-v3_${normalizeName(teamName)}_${tournamentId ?? (competitionName ? normalizeName(competitionName) : 'all')}`;
   
   // Cache SQLite: evita refetching eventos do mesmo time+torneio
   const cached = await getCacheTeamEvents(cacheKey);
   if (cached) return cached;
 
   try {
+    // FotMob/Opta é a fonte principal dos jogos finalizados: os endpoints
+    // funcionam em datacenter e conferem com os números do SofaScore.
+    const fotmobEvents = await getFotmobTeamFinishedEvents(teamName, tournamentId);
+    if (fotmobEvents.length > 0) {
+      await setCacheTeamEvents(cacheKey, fotmobEvents).catch(() => null);
+      return fotmobEvents;
+    }
+
     // Constrói URL com filtro de competição opcional
     let url = `/team-events?team=${encodeURIComponent(teamName)}`;
     if (tournamentId) {
@@ -553,8 +565,10 @@ export async function getEventPlayerStats(eventId: number): Promise<SofaScorePla
     // Cache sujo (shotsOnTarget sempre 0): re-busca e sobrescreve
   }
 
-  const data = await sofaJson(`/player_stats?event_id=${eventId}`);
-  const players = mapPlayerStatsPayload(data);
+  const players =
+    eventId < 0
+      ? await getFotmobEventPlayerStats(eventId)
+      : mapPlayerStatsPayload(await sofaJson(`/player_stats?event_id=${eventId}`));
 
   if (players.length > 0) {
     playerGameStatsCache.set(memKey, players);
@@ -631,8 +645,8 @@ export function historyDbKey(
       ? 'all'
       : `league:${opts?.competition || 'brasileirao'}`;
   return [
-    // v13: histórico oficial via Chromium + API SofaScore.
-    'hist-v13',
+    // v14: histórico finalizado via FotMob/Opta, com SofaScore como reserva.
+    'hist-v14',
     normalizeName(team),
     normalizeName(playerName),
     market,
