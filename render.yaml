@@ -13,5 +13,7 @@ services:
         value: "false"
       - key: PREWARM_ON_START
         value: "false"
+      - key: SCRAPE_PROFILE
+        value: "low-memory"
       - key: SOFA_SERVER_URL
         value: "http://127.0.0.1:54545"

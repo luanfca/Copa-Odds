@@ -225,12 +225,12 @@ export async function scrapeAll(): Promise<ScrapeResult> {
       }
     }
 
-    const playwrightJobs: Array<Promise<{ name: string; data: ScrapedMatch[] }>> = [];
+    const playwrightJobs: Array<() => Promise<{ name: string; data: ScrapedMatch[] }>> = [];
 
     if (useBetfair) {
       logger.info('Betfair: iniciando em paralelo...');
       const betfairComps = ['brasileirao', 'mls'];
-      playwrightJobs.push(
+      playwrightJobs.push(() =>
         runPlaywrightAdapter('Betfair', (ctx) => scrapeBetfair(ctx, betfairComps), 'betfair-session.json')
           .then(data => ({ name: 'Betfair', data })),
       );
@@ -240,7 +240,7 @@ export async function scrapeAll(): Promise<ScrapeResult> {
 
     if (useBet365) {
       logger.info('Bet365: iniciando em paralelo...');
-      playwrightJobs.push(
+      playwrightJobs.push(() =>
         runPlaywrightAdapter('Bet365', scrapeBet365, 'bet365-session.json')
           .then(data => ({ name: 'Bet365', data })),
       );
@@ -250,7 +250,7 @@ export async function scrapeAll(): Promise<ScrapeResult> {
 
     if (usePitaco) {
       logger.info('Pitaco: iniciando em paralelo...');
-      playwrightJobs.push(
+      playwrightJobs.push(() =>
         runPlaywrightAdapter('Pitaco', (ctx) => scrapePitaco(ctx, competitionKeys), 'pitaco-session.json')
           .then(data => ({ name: 'Pitaco', data })),
       );
@@ -260,14 +260,34 @@ export async function scrapeAll(): Promise<ScrapeResult> {
 
     if (useBetsson && !result.betssonOk) {
       logger.info('Betsson: fallback Playwright em paralelo...');
-      playwrightJobs.push(
+      playwrightJobs.push(() =>
         runPlaywrightAdapter('Betsson', scrapeBetsson, 'betsson-session.json')
           .then(data => ({ name: 'Betsson', data })),
       );
     }
 
     if (playwrightJobs.length > 0) {
-      const pwResults = await Promise.allSettled(playwrightJobs);
+      // Render Free tem 512 MB. Dois contextos pesados simultâneos
+      // (Betfair + Pitaco) faziam o contêiner reiniciar com HTTP 502.
+      // Nesse ambiente reutilizamos o mesmo browser, uma casa por vez.
+      const lowMemory =
+        scrapeProfile === 'low-memory' || process.env.RENDER === 'true';
+      const pwResults: PromiseSettledResult<{
+        name: string;
+        data: ScrapedMatch[];
+      }>[] = [];
+      if (lowMemory) {
+        logger.info('Playwright em modo de baixa memória: casas serializadas.');
+        for (const job of playwrightJobs) {
+          try {
+            pwResults.push({ status: 'fulfilled', value: await job() });
+          } catch (reason) {
+            pwResults.push({ status: 'rejected', reason });
+          }
+        }
+      } else {
+        pwResults.push(...await Promise.allSettled(playwrightJobs.map((job) => job())));
+      }
       for (const r of pwResults) {
         if (r.status === 'fulfilled') {
           const { name, data } = r.value;
