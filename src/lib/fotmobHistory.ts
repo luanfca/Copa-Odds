@@ -41,7 +41,7 @@ export interface FotmobPlayerGameStat {
   minutes: number;
 }
 
-const teamIdCache = new Map<string, number>();
+const teamIdCache = new Map<string, number | null>();
 const teamEventsCache = new Map<string, FotmobFinishedEvent[]>();
 const playerStatsCache = new Map<number, FotmobPlayerGameStat[]>();
 
@@ -95,23 +95,47 @@ function namesMatch(a: string, b: string): boolean {
 
 async function resolveFotmobTeamId(teamName: string): Promise<number | null> {
   const key = normalizeName(teamName);
-  const cached = teamIdCache.get(key);
-  if (cached) return cached;
+  if (teamIdCache.has(key)) return teamIdCache.get(key) ?? null;
 
-  const data = await fotmobJson(
-    `${FOTMOB_SEARCH}?term=${encodeURIComponent(teamName)}&lang=en`,
+  // Algumas casas acrescentam "FC"/"SC", enquanto a busca do FotMob só
+  // reconhece o nome sem o sufixo (ex.: "St. Louis City SC"). Tenta as duas
+  // formas, mas prefere igualdade exata para não escolher "Remo Stars" ou
+  // "Vitoria de Guimaraes" antes de Remo/Vitória.
+  const searchTerms = [
+    teamName,
+    teamName.replace(/\s+(?:FC|SC|EC|AC)$/i, '').trim(),
+  ].filter((term, index, all) => term && all.indexOf(term) === index);
+
+  let fuzzyOption: any | null = null;
+  for (const term of searchTerms) {
+    const data = await fotmobJson(
+      `${FOTMOB_SEARCH}?term=${encodeURIComponent(term)}&lang=en`,
+    );
+    const options = (data?.teamSuggest ?? []).flatMap(
+      (group: any) => group?.options ?? [],
+    );
+    const exact = options.find((option: any) => {
+      const optionName = option?.text?.split('|')?.[0] ?? '';
+      return normalizeName(optionName) === normalizeName(term);
+    });
+    if (exact) {
+      const id = Number(exact?.payload?.id ?? exact?.text?.split('|')?.[1]);
+      if (Number.isFinite(id) && id > 0) {
+        teamIdCache.set(key, id);
+        return id;
+      }
+    }
+    fuzzyOption ??= options.find((option: any) =>
+      namesMatch(option?.text?.split('|')?.[0] ?? '', term),
+    );
+  }
+
+  const fuzzyId = Number(
+    fuzzyOption?.payload?.id ?? fuzzyOption?.text?.split('|')?.[1],
   );
-  const options = (data?.teamSuggest ?? []).flatMap(
-    (group: any) => group?.options ?? [],
-  );
-  const exact =
-    options.find((option: any) =>
-      namesMatch(option?.text?.split('|')?.[0] ?? '', teamName),
-    ) ?? options[0];
-  const id = Number(exact?.payload?.id ?? exact?.text?.split('|')?.[1]);
-  if (!Number.isFinite(id) || id <= 0) return null;
-  teamIdCache.set(key, id);
-  return id;
+  const resolved = Number.isFinite(fuzzyId) && fuzzyId > 0 ? fuzzyId : null;
+  teamIdCache.set(key, resolved);
+  return resolved;
 }
 
 function parseNextData(html: string): any | null {
@@ -180,7 +204,9 @@ export async function getFotmobTeamFinishedEvents(
   }
 
   results.sort((a, b) => b.startTimestamp - a.startTimestamp);
-  if (results.length) teamEventsCache.set(cacheKey, results);
+  // Também memoriza misses. Sem isso, um time não resolvido repetia busca e
+  // timeout para cada jogador/mercado durante a mesma coleta diária.
+  teamEventsCache.set(cacheKey, results);
   return results;
 }
 

@@ -446,6 +446,9 @@ export async function getTeamFinishedEvents(
     const data = await sofaJson(url);
     if (!data?.events) {
       console.log(`[getTeamFinishedEvents DEBUG] ${teamName}: sofaJson retornou null/sem events. URL: ${url}`);
+      // Miss compartilhado por 3h: impede repetir o mesmo fallback bloqueado
+      // para cada jogador do time durante a coleta diária.
+      await setCacheTeamEvents(cacheKey, []).catch(() => null);
       return [];
     }
 
@@ -477,10 +480,11 @@ export async function getTeamFinishedEvents(
     }
     console.log(`[getTeamFinishedEvents DEBUG] ${teamName}: ${results.length} eventos passados. Torneios: ${JSON.stringify(tournamentSummary)}`);
 
-    if (results.length > 0) setCacheTeamEvents(cacheKey, results).catch(() => {});
+    await setCacheTeamEvents(cacheKey, results).catch(() => null);
     return results;
   } catch (err) {
     console.error(`[SofaScore] getTeamFinishedEvents(${teamName}):`, String(err));
+    await setCacheTeamEvents(cacheKey, []).catch(() => null);
     return [];
   }
 }
